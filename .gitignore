@@ -1,0 +1,17 @@
+# data & outputs
+sam3input/
+database/
+outputs/
+**/*.pt
+**/*.pth
+**/*.npz
+**/*.npy
+**/*.ckpt
+**/*.zip
+**/*.tar
+**/*.tar.gz
+**/*.7z
+
+# caches
+__pycache__/
+*.pyc

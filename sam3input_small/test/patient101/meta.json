@@ -1,0 +1,16 @@
+{
+  "patient_id": "patient101",
+  "split": "test",
+  "num_frames": 2,
+  "ed_frame": 1,
+  "es_frame": 14,
+  "slice_stride": 1,
+  "max_slices": null,
+  "percentile_low": 1.0,
+  "percentile_high": 99.0,
+  "intensity_min": 15.0,
+  "intensity_max": 167.0,
+  "exported_gt": true,
+  "exported_gt_vis": true,
+  "use_4d_for_video": true
+}
