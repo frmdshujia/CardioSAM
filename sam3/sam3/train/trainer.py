@@ -242,7 +242,7 @@ class Trainer:
         """
         self.start_time = time.time()
         self.ckpt_time_elapsed = 0
-        self.est_epoch_time = dict.fromkeys([Phase.TRAIN, Phase.VAL, Phase.TEST], 0)
+        self.est_epoch_time = dict.fromkeys([Phase.TRAIN, Phase.VAL], 0)
 
     def _get_meters(self, phase_filters=None):
         if self.meters is None:
@@ -550,7 +550,7 @@ class Trainer:
         return ret_tuple
 
     def run(self):
-        assert self.mode in ["train", "train_only", "val", "test"]
+        assert self.mode in ["train", "train_only", "val"]
         if self.mode == "train":
             if self.epoch > 0:
                 logging.info(f"Resuming training from epoch: {self.epoch}")
@@ -562,22 +562,17 @@ class Trainer:
                     self.epoch += 1
             self.run_train()
             self.run_val()
-            self.run_test()
         elif self.mode == "val":
             self.run_val()
-        elif self.mode == "test":
-            self.run_test()
         elif self.mode == "train_only":
             self.run_train()
 
     def _setup_dataloaders(self):
         self.train_dataset = None
         self.val_dataset = None
-        self.test_dataset = None
 
-        if self.mode in ["train", "val", "test"]:
+        if self.mode in ["train", "val"]:
             self.val_dataset = instantiate(self.data_conf.get(Phase.VAL, None))
-            self.test_dataset = instantiate(self.data_conf.get(Phase.TEST, None))
 
         if self.mode in ["train", "train_only"]:
             self.train_dataset = instantiate(self.data_conf.train)
@@ -630,61 +625,19 @@ class Trainer:
 
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch))
         outs = self.val_epoch(dataloader, phase=Phase.VAL)
+        # -------------------- Custom: upload val segm visualizations to W&B --------------------
+        # The WandbLogger has `log_coco_segm_samples()`, but it must be explicitly invoked.
+        # We call it after meters are synchronized (inside `val_epoch`), so the merged
+        # COCO prediction json should already be present on rank 0.
+        self._maybe_log_wandb_val_segm_samples()
+        # --------------------------------------------------------------------------------------
         del dataloader
         gc.collect()
-
-        # ==================== 自定义添加：验证分割可视化上传到wandb（按epoch追加，不覆盖） ====================
-        # 说明：尽量不侵入原有流程，仅在 rank0 且 wandb 启用时执行。
-        if self.distributed_rank == 0 and getattr(self.logger, "wb_logger", None) is not None:
-            wb_logger = self.logger.wb_logger
-            segm_vis_cfg = getattr(wb_logger, "segm_vis", None)
-            if isinstance(segm_vis_cfg, Mapping) and segm_vis_cfg.get("enabled", False):
-                # 1) 找到 segm 预测文件（来自 PredictionDumper，文件名是固定的）
-                pred_json_path = None
-                try:
-                    for meter in self._get_meters([Phase.VAL]).values():
-                        if getattr(meter, "iou_type", None) == "segm" and getattr(meter, "dump_dir", None):
-                            pred_json_path = os.path.join(
-                                meter.dump_dir, f"coco_predictions_{meter.iou_type}.json"
-                            )
-                            break
-                except Exception:
-                    pred_json_path = None
-
-                # 2) 从 val dataset 里拿到 GT json 和图片根目录（固定样本选择依赖 GT）
-                val_ds = getattr(self.val_dataset, "dataset", None)
-                gt_json_path = getattr(val_ds, "annFile", None)
-                img_root = getattr(val_ds, "root", None)
-
-                if pred_json_path and gt_json_path and img_root:
-                    wb_logger.log_coco_segm_samples(
-                        pred_json_path=pred_json_path,
-                        gt_json_path=str(gt_json_path),
-                        img_root=str(img_root),
-                        step=int(self.epoch),
-                    )
-        # ==================== 自定义添加结束 ====================
-
         self.logger.log_dict(outs, self.epoch)  # Logged only on rank 0
 
         if self.distributed_rank == 0:
             with g_pathmgr.open(
                 os.path.join(self.logging_conf.log_dir, "val_stats.json"),
-                "a",
-            ) as f:
-                f.write(json.dumps(outs) + "\n")
-
-    def run_test(self):
-        if not self.test_dataset:
-            return
-        dataloader = self.test_dataset.get_loader(epoch=int(self.epoch))
-        outs = self.val_epoch(dataloader, phase=Phase.TEST)
-        del dataloader
-        gc.collect()
-        self.logger.log_dict(outs, self.epoch)
-        if self.distributed_rank == 0:
-            with g_pathmgr.open(
-                os.path.join(self.logging_conf.log_dir, "test_stats.json"),
                 "a",
             ) as f:
                 f.write(json.dumps(outs) + "\n")
@@ -802,6 +755,61 @@ class Trainer:
         self._reset_meters(curr_phases)
         logging.info(f"Meters: {out_dict}")
         return out_dict
+
+    def _maybe_log_wandb_val_segm_samples(self) -> None:
+        """
+        If W&B is enabled and segm_vis is configured, render + upload a fixed set of
+        validation segmentation overlays (pred vs gt) using the COCO pred json produced
+        by the val segmentation meter (PredictionDumper).
+        """
+        # Access the underlying WandbLogger (rank 0 only inside it).
+        wb_logger = getattr(self.logger, "wb_logger", None)
+        if wb_logger is None or not hasattr(wb_logger, "log_coco_segm_samples"):
+            return
+
+        # Image root: taken from the val dataset (TorchDataset -> Sam3ImageDataset -> VisionDataset.root).
+        img_root = None
+        try:
+            img_root = getattr(getattr(self.val_dataset, "dataset", None), "root", None)
+        except Exception:
+            img_root = None
+        if not img_root:
+            return
+
+        # Find a segmentation PredictionDumper meter and derive the merged pred json path.
+        try:
+            meters = self._get_meters([Phase.VAL])
+        except Exception:
+            meters = {}
+
+        for _, meter in meters.items():
+            if getattr(meter, "iou_type", None) != "segm":
+                continue
+            dump_dir = getattr(meter, "dump_dir", None)
+            if not dump_dir:
+                continue
+
+            pred_json_path = os.path.join(dump_dir, f"coco_predictions_{meter.iou_type}.json")
+
+            # GT json path: best-effort pick from pred_file_evaluators (ACDC uses gt_path there).
+            gt_json_path = None
+            for evaluator in (getattr(meter, "pred_file_evaluators", None) or []):
+                cand = getattr(evaluator, "gt_path", None)
+                if cand:
+                    gt_json_path = cand
+                    break
+            if not gt_json_path:
+                continue
+
+            try:
+                wb_logger.log_coco_segm_samples(
+                    pred_json_path=pred_json_path,
+                    gt_json_path=gt_json_path,
+                    img_root=img_root,
+                    step=int(self.epoch),
+                )
+            except Exception as e:
+                logging.warning(f"W&B segm vis: failed to log samples. err={e}")
 
     def _get_trainer_state(self, phase):
         return {
@@ -1107,17 +1115,17 @@ class Trainer:
                         )
 
     def _setup_components(self):
-        # Get the keys for all the eval datasets, if any
-        for eval_phase in [Phase.VAL, Phase.TEST]:
-            eval_keys = None
-            if self.data_conf.get(eval_phase, None) is not None:
-                eval_keys = collect_dict_keys(self.data_conf[eval_phase])
-            # Additional checks on the sanity of the config for eval datasets
-            self._check_val_key_match(eval_keys, phase=eval_phase)
+        # Get the keys for all the val datasets, if any
+        val_phase = Phase.VAL
+        val_keys = None
+        if self.data_conf.get(val_phase, None) is not None:
+            val_keys = collect_dict_keys(self.data_conf[val_phase])
+        # Additional checks on the sanity of the config for val datasets
+        self._check_val_key_match(val_keys, phase=val_phase)
 
         logging.info("Setting up components: Model, loss, optim, meters etc.")
         self.epoch = 0
-        self.steps = {Phase.TRAIN: 0, Phase.VAL: 0, Phase.TEST: 0}
+        self.steps = {Phase.TRAIN: 0, Phase.VAL: 0}
 
         self.logger = Logger(self.logging_conf)
 

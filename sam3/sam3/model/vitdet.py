@@ -14,6 +14,7 @@ Rope embedding code adopted from:
 
 import math
 from functools import partial
+from itertools import repeat
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -338,6 +339,483 @@ class PatchEmbed(nn.Module):
         return x
 
 
+'''
+to_2tuple 只是个辅助小工具，核心作用是让 “高 / 宽” 参数成对出现，不用反复写；
+OverlapPatchEmbed 是核心工具，本质是 “带重叠的切图 + 编码”：用卷积（智能切刀）把图片切成重叠的小补丁，再把每个补丁转成 AI 能看懂的数字串；
+重叠切图的好处是保留更多图片细节，让 AI 识别更准确（比如能看清图片边缘的小物体）。
+'''
+def to_2tuple(x):
+    if isinstance(x, tuple):
+        return x
+    if isinstance(x, list):
+        return tuple(x)
+    if isinstance(x, Tensor) and x.numel() == 1:
+        v = x.item()
+        return (v, v)
+    if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)):
+        return tuple(x)
+    return tuple(repeat(x, 2))
+
+
+class OverlapPatchEmbed(nn.Module):
+    """Image to Patch Embedding."""
+
+    def __init__(
+        self, img_size=224, patch_size=7, stride=4, in_chans=3, embed_dim=768
+    ):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.H, self.W = img_size[0] // patch_size[0], img_size[1] // patch_size[1]
+        self.num_patches = self.H * self.W
+        self.proj = nn.Conv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=stride,
+            padding=(patch_size[0] // 2, patch_size[1] // 2),
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            fan_out //= m.groups
+            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def forward(self, x):
+        x = self.proj(x)
+        _, _, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        return x, H, W
+
+'''
+整个类就干三件事：① 造一个 “高斯核”（磨皮用的权重模板）；② 把核存起来；③ 用这个核给图片做滤波（磨皮）。
+'''
+class GaussianFilter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("kernel", self._gauss_kernel(), persistent=False)
+
+    def _gauss_kernel(self, channels=3):
+        kernel = torch.tensor(
+            [
+                [1.0, 4.0, 6.0, 4.0, 1.0],
+                [4.0, 16.0, 24.0, 16.0, 4.0],
+                [6.0, 24.0, 36.0, 24.0, 6.0],
+                [4.0, 16.0, 24.0, 16.0, 4.0],
+                [1.0, 4.0, 6.0, 4.0, 1.0],
+            ]
+        )
+        kernel /= 256.0
+        kernel = kernel.repeat(channels, 1, 1, 1)
+        return kernel
+
+    def conv_gauss(self, img):
+        kernel = self.kernel.to(device=img.device, dtype=img.dtype)
+        img = torch.nn.functional.pad(img, (2, 2, 2, 2), mode="reflect")
+        out = torch.nn.functional.conv2d(img, kernel, groups=img.shape[1])
+        return out
+
+'''
+SRMFilter 是图片 “瑕疵 / 细节检测工具”，核心是 3 个固定的 5×5 滤波模板，专门突出图片里的边缘、噪点、伪影；
+'''
+class SRMFilter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.srm_layer = nn.Conv2d(3, 3, kernel_size=5, stride=1, padding=2)
+        filter1 = [
+            [0, 0, 0, 0, 0],
+            [0, -1 / 4, 2 / 4, -1 / 4, 0],
+            [0, 2 / 4, -4 / 4, 2 / 4, 0],
+            [0, -1 / 4, 2 / 4, -1 / 4, 0],
+            [0, 0, 0, 0, 0],
+        ]
+        filter2 = [
+            [-1 / 12, 2 / 12, -2 / 12, 2 / 12, -1 / 12],
+            [2 / 12, -6 / 12, 8 / 12, -6 / 12, 2 / 12],
+            [-2 / 12, 8 / 12, -12 / 12, 8 / 12, -2 / 12],
+            [2 / 12, -6 / 12, 8 / 12, -6 / 12, 2 / 12],
+            [-1 / 12, 2 / 12, -2 / 12, 2 / 12, -1 / 12],
+        ]
+        filter3 = [
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 1 / 2, -2 / 2, 1 / 2, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ]
+        self.srm_layer.weight.data = torch.Tensor(
+            [[filter1, filter1, filter1], [filter2, filter2, filter2], [filter3, filter3, filter3]]
+        )
+        for param in self.srm_layer.parameters():
+            param.requires_grad = False
+
+    def conv_srm(self, img):
+        return self.srm_layer(img)
+
+'''
+PromptGenerator 是 AI 模型的 “提示生成器”，核心是预处理图片 + 切图编码 + 特征适配，给模型喂针对性的特征；
+预处理阶段：支持高斯磨皮、SRM 细节提取、傅里叶高低频滤波，按需选择；
+特征编码：手工调优（OverlapPatchEmbed 切重叠补丁）+ 嵌入调优（Linear 降维），双路特征融合；
+适配器阶段：分 3 种类型（部分共享 / 完全共享 / 完全不共享），把降维后的特征还原回模型能识别的维度；
+最终输出：原特征 + 提示特征，帮模型聚焦关键信息，提升任务效果。
+'''
+class PromptGenerator(nn.Module):
+    def __init__(
+        self,
+        scale_factor,
+        prompt_type,
+        embed_dims,
+        tuning_stage,
+        depths,
+        input_type,
+        freq_nums,
+        handcrafted_tune,
+        embedding_tune,
+        adaptor,
+        img_size,
+    ):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.prompt_type = prompt_type
+        self.embed_dims = embed_dims
+        self.input_type = input_type
+        self.freq_nums = freq_nums
+        self.tuning_stage = tuning_stage
+        self.depths = depths
+        self.handcrafted_tune = handcrafted_tune
+        self.embedding_tune = embedding_tune
+        self.adaptor = adaptor
+
+        if self.input_type == "gaussian":
+            self.gaussian_filter = GaussianFilter()
+        if self.input_type == "srm":
+            self.srm_filter = SRMFilter()
+        if self.input_type == "all":
+            self.prompt = nn.Parameter(
+                torch.zeros(3, img_size, img_size), requires_grad=False
+            )
+
+        if self.handcrafted_tune:
+            if "1" in self.tuning_stage:
+                self.handcrafted_generator1 = OverlapPatchEmbed(
+                    img_size=img_size,
+                    patch_size=7,
+                    stride=4,
+                    in_chans=3,
+                    embed_dim=self.embed_dims[0] // self.scale_factor,
+                )
+            if "2" in self.tuning_stage:
+                self.handcrafted_generator2 = OverlapPatchEmbed(
+                    img_size=img_size // 4,
+                    patch_size=3,
+                    stride=2,
+                    in_chans=self.embed_dims[0] // self.scale_factor,
+                    embed_dim=self.embed_dims[1] // self.scale_factor,
+                )
+            if "3" in self.tuning_stage:
+                self.handcrafted_generator3 = OverlapPatchEmbed(
+                    img_size=img_size // 8,
+                    patch_size=3,
+                    stride=2,
+                    in_chans=self.embed_dims[1] // self.scale_factor,
+                    embed_dim=self.embed_dims[2] // self.scale_factor,
+                )
+            if "4" in self.tuning_stage:
+                self.handcrafted_generator4 = OverlapPatchEmbed(
+                    img_size=img_size // 16,
+                    patch_size=3,
+                    stride=2,
+                    in_chans=self.embed_dims[2] // self.scale_factor,
+                    embed_dim=self.embed_dims[3] // self.scale_factor,
+                )
+
+        if self.embedding_tune:
+            if "1" in self.tuning_stage:
+                self.embedding_generator1 = nn.Linear(
+                    self.embed_dims[0], self.embed_dims[0] // self.scale_factor
+                )
+            if "2" in self.tuning_stage:
+                self.embedding_generator2 = nn.Linear(
+                    self.embed_dims[1], self.embed_dims[1] // self.scale_factor
+                )
+            if "3" in self.tuning_stage:
+                self.embedding_generator3 = nn.Linear(
+                    self.embed_dims[2], self.embed_dims[2] // self.scale_factor
+                )
+            if "4" in self.tuning_stage:
+                self.embedding_generator4 = nn.Linear(
+                    self.embed_dims[3], self.embed_dims[3] // self.scale_factor
+                )
+
+        if self.adaptor == "adaptor":
+            if "1" in self.tuning_stage:
+                for i in range(self.depths[0] + 1):
+                    lightweight_mlp = nn.Sequential(
+                        nn.Linear(
+                            self.embed_dims[0] // self.scale_factor,
+                            self.embed_dims[0] // self.scale_factor,
+                        ),
+                        nn.GELU(),
+                    )
+                    setattr(self, f"lightweight_mlp1_{i}", lightweight_mlp)
+                self.shared_mlp1 = nn.Linear(
+                    self.embed_dims[0] // self.scale_factor, self.embed_dims[0]
+                )
+
+            if "2" in self.tuning_stage:
+                for i in range(self.depths[1] + 1):
+                    lightweight_mlp = nn.Sequential(
+                        nn.Linear(
+                            self.embed_dims[1] // self.scale_factor,
+                            self.embed_dims[1] // self.scale_factor,
+                        ),
+                        nn.GELU(),
+                    )
+                    setattr(self, f"lightweight_mlp2_{i}", lightweight_mlp)
+                self.shared_mlp2 = nn.Linear(
+                    self.embed_dims[1] // self.scale_factor, self.embed_dims[1]
+                )
+
+            if "3" in self.tuning_stage:
+                for i in range(self.depths[2] + 1):
+                    lightweight_mlp = nn.Sequential(
+                        nn.Linear(
+                            self.embed_dims[2] // self.scale_factor,
+                            self.embed_dims[2] // self.scale_factor,
+                        ),
+                        nn.GELU(),
+                    )
+                    setattr(self, f"lightweight_mlp3_{i}", lightweight_mlp)
+                self.shared_mlp3 = nn.Linear(
+                    self.embed_dims[2] // self.scale_factor, self.embed_dims[2]
+                )
+
+            if "4" in self.tuning_stage:
+                for i in range(self.depths[3] + 1):
+                    lightweight_mlp = nn.Sequential(
+                        nn.Linear(
+                            self.embed_dims[3] // self.scale_factor,
+                            self.embed_dims[3] // self.scale_factor,
+                        ),
+                        nn.GELU(),
+                    )
+                    setattr(self, f"lightweight_mlp4_{i}", lightweight_mlp)
+                self.shared_mlp4 = nn.Linear(
+                    self.embed_dims[3] // self.scale_factor, self.embed_dims[3]
+                )
+
+        elif self.adaptor == "fully_shared":
+            self.fully_shared_mlp1 = nn.Sequential(
+                nn.Linear(
+                    self.embed_dims[0] // self.scale_factor,
+                    self.embed_dims[0] // self.scale_factor,
+                ),
+                nn.GELU(),
+                nn.Linear(self.embed_dims[0] // self.scale_factor, self.embed_dims[0]),
+            )
+            self.fully_shared_mlp2 = nn.Sequential(
+                nn.Linear(
+                    self.embed_dims[1] // self.scale_factor,
+                    self.embed_dims[1] // self.scale_factor,
+                ),
+                nn.GELU(),
+                nn.Linear(self.embed_dims[1] // self.scale_factor, self.embed_dims[1]),
+            )
+            self.fully_shared_mlp3 = nn.Sequential(
+                nn.Linear(
+                    self.embed_dims[2] // self.scale_factor,
+                    self.embed_dims[2] // self.scale_factor,
+                ),
+                nn.GELU(),
+                nn.Linear(self.embed_dims[2] // self.scale_factor, self.embed_dims[2]),
+            )
+            self.fully_shared_mlp4 = nn.Sequential(
+                nn.Linear(
+                    self.embed_dims[3] // self.scale_factor,
+                    self.embed_dims[3] // self.scale_factor,
+                ),
+                nn.GELU(),
+                nn.Linear(self.embed_dims[3] // self.scale_factor, self.embed_dims[3]),
+            )
+
+        elif self.adaptor == "fully_unshared":
+            for i in range(self.depths[0]):
+                fully_unshared_mlp1 = nn.Sequential(
+                    nn.Linear(
+                        self.embed_dims[0] // self.scale_factor,
+                        self.embed_dims[0] // self.scale_factor,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        self.embed_dims[0] // self.scale_factor, self.embed_dims[0]
+                    ),
+                )
+                setattr(self, f"fully_unshared_mlp1_{i}", fully_unshared_mlp1)
+            for i in range(self.depths[1]):
+                fully_unshared_mlp2 = nn.Sequential(
+                    nn.Linear(
+                        self.embed_dims[1] // self.scale_factor,
+                        self.embed_dims[1] // self.scale_factor,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        self.embed_dims[1] // self.scale_factor, self.embed_dims[1]
+                    ),
+                )
+                setattr(self, f"fully_unshared_mlp2_{i}", fully_unshared_mlp2)
+            for i in range(self.depths[2]):
+                fully_unshared_mlp3 = nn.Sequential(
+                    nn.Linear(
+                        self.embed_dims[2] // self.scale_factor,
+                        self.embed_dims[2] // self.scale_factor,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        self.embed_dims[2] // self.scale_factor, self.embed_dims[2]
+                    ),
+                )
+                setattr(self, f"fully_unshared_mlp3_{i}", fully_unshared_mlp3)
+            for i in range(self.depths[3]):
+                fully_unshared_mlp4 = nn.Sequential(
+                    nn.Linear(
+                        self.embed_dims[3] // self.scale_factor,
+                        self.embed_dims[3] // self.scale_factor,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        self.embed_dims[3] // self.scale_factor, self.embed_dims[3]
+                    ),
+                )
+                setattr(self, f"fully_unshared_mlp4_{i}", fully_unshared_mlp4)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            fan_out //= m.groups
+            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def init_handcrafted(self, x):
+        if self.input_type == "fft":
+            x = self.fft(x, self.freq_nums, self.prompt_type)
+        elif self.input_type == "all":
+            x = self.prompt.unsqueeze(0).repeat(x.shape[0], 1, 1, 1)
+        elif self.input_type == "gaussian":
+            x = self.gaussian_filter.conv_gauss(x)
+        elif self.input_type == "srm":
+            x = self.srm_filter.srm_layer(x)
+
+        B = x.shape[0]
+        if "1" in self.tuning_stage:
+            handcrafted1, H1, W1 = self.handcrafted_generator1(x)
+        else:
+            handcrafted1 = None
+
+        if "2" in self.tuning_stage:
+            handcrafted2, H2, W2 = self.handcrafted_generator2(
+                handcrafted1.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
+            )
+        else:
+            handcrafted2 = None
+
+        if "3" in self.tuning_stage:
+            handcrafted3, H3, W3 = self.handcrafted_generator3(
+                handcrafted2.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
+            )
+        else:
+            handcrafted3 = None
+
+        if "4" in self.tuning_stage:
+            handcrafted4, H4, W4 = self.handcrafted_generator4(
+                handcrafted3.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
+            )
+        else:
+            handcrafted4 = None
+
+        return handcrafted1, handcrafted2, handcrafted3, handcrafted4
+
+    def init_prompt(self, embedding_feature, handcrafted_feature, block_num):
+        if self.embedding_tune:
+            embedding_generator = getattr(self, f"embedding_generator{block_num}")
+            embedding_feature = embedding_generator(embedding_feature)
+        if self.handcrafted_tune:
+            handcrafted_feature = handcrafted_feature
+        return handcrafted_feature, embedding_feature
+
+    def get_prompt(self, x, prompt, block_num, depth_num):
+        feat = 0
+        B, H, W = prompt[1].shape[0], prompt[1].shape[1], prompt[1].shape[2]
+        if self.handcrafted_tune:
+            feat += prompt[0].reshape(B, H, W, -1)
+        if self.embedding_tune:
+            feat = feat + prompt[1]
+
+        if self.adaptor == "adaptor":
+            lightweight_mlp = getattr(
+                self, f"lightweight_mlp{block_num}_{depth_num}"
+            )
+            shared_mlp = getattr(self, f"shared_mlp{block_num}")
+            feat = lightweight_mlp(feat)
+            feat = shared_mlp(feat)
+        elif self.adaptor == "fully_shared":
+            fully_shared_mlp = getattr(self, f"fully_shared_mlp{block_num}")
+            feat = fully_shared_mlp(feat)
+        elif self.adaptor == "fully_unshared":
+            fully_unshared_mlp = getattr(
+                self, f"fully_unshared_mlp{block_num}_{depth_num}"
+            )
+            feat = fully_unshared_mlp(feat)
+
+        return x + feat
+
+    def fft(self, x, rate, prompt_type):
+        mask = torch.zeros_like(x)
+        w, h = x.shape[-2:]
+        line = int((w * h * rate) ** 0.5 // 2)
+        mask[:, :, w // 2 - line : w // 2 + line, h // 2 - line : h // 2 + line] = 1
+
+        fft = torch.fft.fftshift(torch.fft.fft2(x, norm="forward"))
+
+        if prompt_type == "highpass":
+            fft = fft * (1 - mask)
+        elif prompt_type == "lowpass":
+            fft = fft * mask
+        fr = fft.real
+        fi = fft.imag
+
+        fft_hires = torch.fft.ifftshift(torch.complex(fr, fi))
+        inv = torch.fft.ifft2(fft_hires, norm="forward").real
+        inv = torch.abs(inv)
+        return inv
+
+
 class Attention(nn.Module):
     """Multi-head Attention block with relative position embeddings and 2d-rope."""
 
@@ -655,6 +1133,13 @@ class ViT(nn.Module):
         bias_patch_embed: bool = True,
         compile_mode: Optional[str] = None,
         use_act_checkpoint: bool = True,
+        # ================= Adapter 参数 =================
+        enable_adapter: bool = False,
+        tuning_stage: str = "1234",
+        handcrafted_tune: bool = True,
+        embedding_tune: bool = True,
+        adaptor: str = "adaptor",
+        # ===============================================
     ):
         """
         Args:
@@ -695,6 +1180,33 @@ class ViT(nn.Module):
         """
         super().__init__()
         self.pretrain_use_cls_token = pretrain_use_cls_token
+        self.enable_adapter = enable_adapter
+
+        if self.enable_adapter:
+            # 计算每个 stage 的 depth 分配，并初始化 Adapter
+            if retain_cls_token:
+                raise ValueError(
+                    "Adapter injection does not support retain_cls_token=True."
+                )
+            self.depth_per_stage = depth // 4
+            remainder = depth % 4
+            depths_list = [self.depth_per_stage] * 4
+            if remainder > 0:
+                depths_list[-1] += remainder
+
+            self.prompt_generator = PromptGenerator(
+                scale_factor=32,
+                prompt_type="highpass",
+                embed_dims=[embed_dim, embed_dim, embed_dim, embed_dim],
+                tuning_stage=tuning_stage,
+                depths=depths_list,
+                input_type="fft",
+                freq_nums=0.25,
+                handcrafted_tune=handcrafted_tune,
+                embedding_tune=embedding_tune,
+                adaptor=adaptor,
+                img_size=img_size,
+            )
 
         window_block_indexes = [i for i in range(depth) if i not in global_att_blocks]
         self.full_attn_ids = list(global_att_blocks)
@@ -812,7 +1324,32 @@ class ViT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    def _resize_handcrafted(self, feature, target_h, target_w):
+        """
+        将手工特征缩放到 ViT 特征大小，兼容多种维度格式。
+        """
+        if feature is None:
+            return None
+
+        if feature.ndim == 3:
+            feature = feature.unsqueeze(1)
+
+        if feature.ndim == 4:
+            if feature.shape[-1] < feature.shape[1]:
+                feature = feature.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+
+        if feature.shape[2] != target_h or feature.shape[3] != target_w:
+            feature = F.interpolate(
+                feature,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        return feature.permute(0, 2, 3, 1)
+
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        inp = x
         x = self.patch_embed(x)
         h, w = x.shape[1], x.shape[2]
 
@@ -834,8 +1371,39 @@ class ViT(nn.Module):
 
         x = self.ln_pre(x)
 
+        if self.enable_adapter:
+            # 预先生成手工特征（如 FFT 高频）
+            handcrafted_list = self.prompt_generator.init_handcrafted(inp)
+
         outputs = []
         for i, blk in enumerate(self.blocks):
+            if self.enable_adapter:
+                # 根据 block 所在 stage 注入 Adapter prompt
+                if i < self.depth_per_stage:
+                    stage_idx = 1
+                    rel_idx = i
+                elif i < self.depth_per_stage * 2:
+                    stage_idx = 2
+                    rel_idx = i - self.depth_per_stage
+                elif i < self.depth_per_stage * 3:
+                    stage_idx = 3
+                    rel_idx = i - self.depth_per_stage * 2
+                else:
+                    stage_idx = 4
+                    rel_idx = i - self.depth_per_stage * 3
+
+                current_handcrafted = handcrafted_list[stage_idx - 1]
+                if str(stage_idx) in self.prompt_generator.tuning_stage:
+                    resized_handcrafted = self._resize_handcrafted(
+                        current_handcrafted, h, w
+                    )
+                    prompt_tuple = self.prompt_generator.init_prompt(
+                        x, resized_handcrafted, stage_idx
+                    )
+                    x = self.prompt_generator.get_prompt(
+                        x, prompt_tuple, stage_idx, rel_idx
+                    )
+
             if self.use_act_checkpoint and self.training:
                 x = checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
@@ -851,7 +1419,7 @@ class ViT(nn.Module):
                     feats = feats.permute(0, 3, 1, 2)
                 else:
                     assert feats.ndim == 3
-                    h = w = math.sqrt(feats.shape[1])
+                    # h = w = math.sqrt(feats.shape[1])
                     feats = feats.reshape(
                         feats.shape[0], h, w, feats.shape[-1]
                     ).permute(0, 3, 1, 2)
