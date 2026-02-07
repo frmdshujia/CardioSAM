@@ -242,7 +242,7 @@ class Trainer:
         """
         self.start_time = time.time()
         self.ckpt_time_elapsed = 0
-        self.est_epoch_time = dict.fromkeys([Phase.TRAIN, Phase.VAL], 0)
+        self.est_epoch_time = dict.fromkeys([Phase.TRAIN, Phase.VAL, Phase.TEST], 0)
 
     def _get_meters(self, phase_filters=None):
         if self.meters is None:
@@ -448,6 +448,9 @@ class Trainer:
         self.loss.load_state_dict(checkpoint["loss"], strict=True)
         self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"]
+        # Backward-compatible: older checkpoints may not include test steps.
+        if Phase.TEST not in self.steps:
+            self.steps[Phase.TEST] = 0
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed")
 
         if self.optim_conf.amp.enabled and "scaler" in checkpoint:
@@ -485,6 +488,37 @@ class Trainer:
                 return meter
         return None
 
+    def _count_effective_targets(self, find_targets) -> int:
+        total = 0
+        for target in find_targets or []:
+            if target is None:
+                continue
+            if isinstance(target, dict):
+                num_boxes = target.get("num_boxes", None)
+            else:
+                num_boxes = getattr(target, "num_boxes", None)
+            if num_boxes is None:
+                continue
+            if isinstance(num_boxes, torch.Tensor):
+                total += int(num_boxes.sum().item())
+            else:
+                total += int(sum(num_boxes))
+        return total
+
+    def _compute_grad_norm(self, norm_type: float = 2.0) -> float:
+        parameters = [p for p in self.model.parameters() if p.grad is not None]
+        if not parameters:
+            return 0.0
+        if norm_type == float("inf"):
+            total_norm = max(p.grad.detach().abs().max().item() for p in parameters)
+        else:
+            total_norm = 0.0
+            for p in parameters:
+                param_norm = p.grad.detach().norm(norm_type)
+                total_norm += param_norm.item() ** norm_type
+            total_norm = total_norm ** (1.0 / norm_type)
+        return float(total_norm)
+
     def _step(
         self,
         batch: BatchedDatapoint,
@@ -519,6 +553,17 @@ class Trainer:
             self.logger.log(
                 loss_log_str,
                 loss,
+                self.steps[phase],
+            )
+            effective_targets = self._count_effective_targets(find_targets)
+            self.logger.log(
+                os.path.join("Step_Stats", phase, "EffectiveTargets"),
+                effective_targets,
+                self.steps[phase],
+            )
+            self.logger.log(
+                os.path.join("Step_Stats", phase, "TargetsPerImage"),
+                effective_targets / max(1, batch_size),
                 self.steps[phase],
             )
 
@@ -559,20 +604,40 @@ class Trainer:
                     logging.info("Running previous val epoch")
                     self.epoch -= 1
                     self.run_val()
+                    self.run_test()
                     self.epoch += 1
             self.run_train()
             self.run_val()
+            self.run_test()
         elif self.mode == "val":
             self.run_val()
+            self.run_test()
         elif self.mode == "train_only":
             self.run_train()
+
+    def _get_wandb_step(self) -> int:
+        """
+        W&B 的 `step` 必须全局单调递增。
+
+        该 Trainer 在 train/val/test 三个 phase 内部会用各自的 step 计数器；
+        如果把 epoch 作为 step（很小）去 log，会触发 W&B 的 out-of-order 警告并丢弃数据。
+
+        这里统一返回当前三者 step 的最大值，作为“全局 step”。
+        """
+        try:
+            return int(max(self.steps.values()))
+        except Exception:
+            return int(self.epoch)
 
     def _setup_dataloaders(self):
         self.train_dataset = None
         self.val_dataset = None
+        self.test_dataset = None
 
         if self.mode in ["train", "val"]:
             self.val_dataset = instantiate(self.data_conf.get(Phase.VAL, None))
+            # Optional: test dataset for periodic evaluation / W&B logging
+            self.test_dataset = instantiate(self.data_conf.get(Phase.TEST, None))
 
         if self.mode in ["train", "train_only"]:
             self.train_dataset = instantiate(self.data_conf.train)
@@ -582,7 +647,8 @@ class Trainer:
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
             barrier()
             outs = self.train_epoch(dataloader)
-            self.logger.log_dict(outs, self.epoch)  # Logged only on rank 0
+            # W&B step 必须单调递增；使用全局 step 避免训练/评估之间 step 回退导致指标被忽略
+            self.logger.log_dict(outs, self._get_wandb_step())  # Logged only on rank 0
 
             # log train to text file.
             if self.distributed_rank == 0:
@@ -602,6 +668,7 @@ class Trainer:
             # loop anyway
             if self.is_intermediate_val_epoch(self.epoch):
                 self.run_val()
+                self.run_test()
                 if torch.cuda.is_available() and self.empty_gpu_mem_cache_after_eval:
                     # release memory buffers held by the model during eval (which typically
                     # involves a lot more frames in video grounding that during training)
@@ -629,15 +696,40 @@ class Trainer:
         # The WandbLogger has `log_coco_segm_samples()`, but it must be explicitly invoked.
         # We call it after meters are synchronized (inside `val_epoch`), so the merged
         # COCO prediction json should already be present on rank 0.
-        self._maybe_log_wandb_val_segm_samples()
+        self._maybe_log_wandb_val_segm_samples(epoch=int(self.epoch), step=self._get_wandb_step())
         # --------------------------------------------------------------------------------------
         del dataloader
         gc.collect()
-        self.logger.log_dict(outs, self.epoch)  # Logged only on rank 0
+        self.logger.log_dict(outs, self._get_wandb_step())  # Logged only on rank 0
 
         if self.distributed_rank == 0:
             with g_pathmgr.open(
                 os.path.join(self.logging_conf.log_dir, "val_stats.json"),
+                "a",
+            ) as f:
+                f.write(json.dumps(outs) + "\n")
+
+    def run_test(self):
+        """
+        Optional test-set evaluation. This is only executed if a test dataset is configured
+        (cfg.trainer.data.test) AND test meters exist (cfg.trainer.meters.test). Results
+        are logged through the same logger (including W&B, if enabled).
+        """
+        if not getattr(self, "test_dataset", None):
+            return
+        # Only run test if meters are configured for it; otherwise it's usually unintended.
+        if not (self.meters_conf is not None and Phase.TEST in self.meters_conf):
+            return
+
+        dataloader = self.test_dataset.get_loader(epoch=int(self.epoch))
+        outs = self.val_epoch(dataloader, phase=Phase.TEST)
+        del dataloader
+        gc.collect()
+        self.logger.log_dict(outs, self._get_wandb_step())  # Logged only on rank 0
+
+        if self.distributed_rank == 0:
+            with g_pathmgr.open(
+                os.path.join(self.logging_conf.log_dir, "test_stats.json"),
                 "a",
             ) as f:
                 f.write(json.dumps(outs) + "\n")
@@ -671,7 +763,7 @@ class Trainer:
             iters_per_epoch,
             [batch_time, data_time, mem, self.time_elapsed_meter, *loss_mts.values()],
             self._get_meters(curr_phases),
-            prefix="Val Epoch: [{}]".format(self.epoch),
+            prefix="Eval Epoch: [{}]".format(self.epoch),
         )
 
         end = time.time()
@@ -731,7 +823,7 @@ class Trainer:
                     self.logger.log(
                         os.path.join("Step_Stats", phase, progress_meter.name),
                         progress_meter.val,
-                        self.steps[Phase.VAL],
+                        self.steps[phase],
                     )
 
             if data_iter % 10 == 0:
@@ -756,7 +848,7 @@ class Trainer:
         logging.info(f"Meters: {out_dict}")
         return out_dict
 
-    def _maybe_log_wandb_val_segm_samples(self) -> None:
+    def _maybe_log_wandb_val_segm_samples(self, *, epoch: int, step: int) -> None:
         """
         If W&B is enabled and segm_vis is configured, render + upload a fixed set of
         validation segmentation overlays (pred vs gt) using the COCO pred json produced
@@ -806,7 +898,8 @@ class Trainer:
                     pred_json_path=pred_json_path,
                     gt_json_path=gt_json_path,
                     img_root=img_root,
-                    step=int(self.epoch),
+                    epoch=int(epoch),
+                    step=int(step),
                 )
             except Exception as e:
                 logging.warning(f"W&B segm vis: failed to log samples. err={e}")
@@ -893,9 +986,20 @@ class Trainer:
                                 self.steps[phase],
                             )
 
+                # Unscale once for AMP before grad stats / clipping
+                if self.optim_conf.amp.enabled:
+                    self.scaler.unscale_(self.optim.optimizer)
+
+                # Log grad norm
+                if data_iter % self.logging_conf.log_scalar_frequency == 0:
+                    self.logger.log(
+                        os.path.join("Grad", "total_norm"),
+                        self._compute_grad_norm(),
+                        self.steps[phase],
+                    )
+
                 # Clipping gradients and detecting diverging gradients
                 if self.gradient_clipper is not None:
-                    self.scaler.unscale_(self.optim.optimizer)
                     self.gradient_clipper(model=self.model)
 
                 if self.gradient_logger is not None:
@@ -1115,17 +1219,16 @@ class Trainer:
                         )
 
     def _setup_components(self):
-        # Get the keys for all the val datasets, if any
-        val_phase = Phase.VAL
-        val_keys = None
-        if self.data_conf.get(val_phase, None) is not None:
-            val_keys = collect_dict_keys(self.data_conf[val_phase])
-        # Additional checks on the sanity of the config for val datasets
-        self._check_val_key_match(val_keys, phase=val_phase)
+        # Get the keys for eval datasets (val/test), if any, and sanity-check them.
+        for eval_phase in [Phase.VAL, Phase.TEST]:
+            eval_keys = None
+            if self.data_conf.get(eval_phase, None) is not None:
+                eval_keys = collect_dict_keys(self.data_conf[eval_phase])
+            self._check_val_key_match(eval_keys, phase=eval_phase)
 
         logging.info("Setting up components: Model, loss, optim, meters etc.")
         self.epoch = 0
-        self.steps = {Phase.TRAIN: 0, Phase.VAL: 0}
+        self.steps = {Phase.TRAIN: 0, Phase.VAL: 0, Phase.TEST: 0}
 
         self.logger = Logger(self.logging_conf)
 

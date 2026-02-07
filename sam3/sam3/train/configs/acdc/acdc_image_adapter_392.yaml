@@ -514,6 +514,10 @@ trainer:
       should_log: True
       # ==================== 自定义添加：W&B 指标过滤（仅保留关键指标） ====================
       log_key_patterns:
+        - "Optim/*"
+        - "Grad/*"
+        - "Step_Stats/train/EffectiveTargets"
+        - "Step_Stats/train/TargetsPerImage"
         - "Meters_train/val_acdc/segmentation/coco_eval_segm_AP"
         - "Losses/train_all_core_loss"
         - "Losses/val_acdc_core_loss"

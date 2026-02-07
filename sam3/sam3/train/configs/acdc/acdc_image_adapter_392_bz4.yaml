@@ -5,7 +5,7 @@
 # ============================================================================
 paths:
   roboflow_vl_100_root: /data/home/shujia/CardioSAM
-  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_adapter_392 # /data/home/shujia/CardioSAM/outputs/test
+  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_adapter_392_bz4_rerun # /data/home/shujia/CardioSAM/outputs/test
   bpe_path: /data/home/shujia/CardioSAM/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # Roboflow dataset configuration
@@ -23,8 +23,6 @@ roboflow_train:
         - _target_: sam3.train.transforms.point_sampling.RandomizeInputBbox
           box_noise_std: 0.1
           box_noise_max: 20
-        - _target_: sam3.train.transforms.prompt_dropout.RandomDropInputBbox
-          prob: 0.5
         - _target_: sam3.train.transforms.segmentation.DecodeRle
         - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
           sizes:
@@ -249,7 +247,7 @@ scratch:
   scheduler_warmup: 20
   scheduler_cooldown: 20
 
-  val_batch_size: 1
+  val_batch_size: 8
   collate_fn_val:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -258,7 +256,7 @@ scratch:
     with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
 
   gradient_accumulation_steps: 1
-  train_batch_size: 1
+  train_batch_size: 8
   collate_fn:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -276,7 +274,7 @@ trainer:
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: false
-  max_epochs: 20
+  max_epochs: 50
   accelerator: cuda
   seed_value: 123
   val_epoch_freq: 1
@@ -309,7 +307,7 @@ trainer:
         img_folder: /data/home/shujia/CardioSAM/sam3input
         ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_train.json
 
-      shuffle: False
+      shuffle: True
       batch_size: ${scratch.train_batch_size}
       num_workers: ${scratch.num_train_workers}
       pin_memory: True
@@ -324,7 +322,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           include_negatives: true
-          category_chunk_size: 2 # Note: You can increase this based on the memory of your GPU.
+          category_chunk_size: 3 # Note: You can increase this based on the memory of your GPU.
           _partial_: true
         img_folder: /data/home/shujia/CardioSAM/sam3input
         ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_val.json
@@ -349,7 +347,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           include_negatives: true
-          category_chunk_size: 2
+          category_chunk_size: 3
           _partial_: true
         img_folder: /data/home/shujia/CardioSAM/sam3input
         ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_test.json
@@ -507,13 +505,17 @@ trainer:
     wandb_writer:
       _target_: sam3.train.utils.logger.make_wandb_logger
       project: acdc_sam3
-      name: acdc_adapter_392 #acdc_small_debug
+      name: acdc_adapter_392_bz4_shffleT #acdc_small_debug
       dir: ${launcher.experiment_log_dir}/wandb
       mode: online
       tags: [acdc, sam3, adapter, res392]
       should_log: True
       # ==================== 自定义添加：W&B 指标过滤（仅保留关键指标） ====================
       log_key_patterns:
+        - "Optim/*"
+        - "Grad/*"
+        - "Step_Stats/train/EffectiveTargets"
+        - "Step_Stats/train/TargetsPerImage"
         - "Meters_train/val_acdc/segmentation/coco_eval_segm_AP"
         - "Losses/train_all_core_loss"
         - "Losses/val_acdc_core_loss"

@@ -5,7 +5,7 @@
 # ============================================================================
 paths:
   roboflow_vl_100_root: /data/home/shujia/CardioSAM
-  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_ft # /data/home/shujia/CardioSAM/outputs/test
+  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_adapter_392_bz4_single_rerun # /data/home/shujia/CardioSAM/outputs/test
   bpe_path: /data/home/shujia/CardioSAM/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # Roboflow dataset configuration
@@ -30,7 +30,9 @@ roboflow_train:
           sizes:
             _target_: sam3.train.transforms.basic.get_random_resize_scales
             size: ${scratch.resolution}
-            min_size: 480
+            # NOTE: min_size must be <= resolution, otherwise sizes=[]
+            # and RandomResizeAPI will crash with "Cannot choose from an empty sequence".
+            min_size: 256
             rounded: false
           max_size:
             _target_: sam3.train.transforms.basic.get_random_resize_max_size
@@ -217,7 +219,7 @@ scratch:
   scale_by_find_batch_size: True
 
   # Image processing parameters
-  resolution: 1008
+  resolution: 392
   consistent_transform: False
   max_ann_per_img: 200
 
@@ -247,7 +249,7 @@ scratch:
   scheduler_warmup: 20
   scheduler_cooldown: 20
 
-  val_batch_size: 1
+  val_batch_size: 8
   collate_fn_val:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -256,7 +258,7 @@ scratch:
     with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
 
   gradient_accumulation_steps: 1
-  train_batch_size: 1
+  train_batch_size: 8
   collate_fn:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
@@ -274,7 +276,7 @@ trainer:
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: false
-  max_epochs: 20
+  max_epochs: 50
   accelerator: cuda
   seed_value: 123
   val_epoch_freq: 1
@@ -298,6 +300,11 @@ trainer:
         limit_ids: ${roboflow_train.num_images}
         transforms: ${roboflow_train.train_transforms}
         load_segmentation: ${scratch.enable_segmentation}
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+          include_negatives: true
+          category_chunk_size: 1  # single-class prompt per datapoint
+          _partial_: true
         max_ann_per_img: 500000
         multiplier: 1
         max_train_queries: 50000
@@ -307,7 +314,7 @@ trainer:
         img_folder: /data/home/shujia/CardioSAM/sam3input
         ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_train.json
 
-      shuffle: False
+      shuffle: True
       batch_size: ${scratch.train_batch_size}
       num_workers: ${scratch.num_train_workers}
       pin_memory: True
@@ -322,7 +329,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           include_negatives: true
-          category_chunk_size: 2 # Note: You can increase this based on the memory of your GPU.
+          category_chunk_size: 1 # single-class prompt per datapoint
           _partial_: true
         img_folder: /data/home/shujia/CardioSAM/sam3input
         ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_val.json
@@ -347,7 +354,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           include_negatives: true
-          category_chunk_size: 2
+          category_chunk_size: 1 # single-class prompt per datapoint
           _partial_: true
         img_folder: /data/home/shujia/CardioSAM/sam3input
         ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_test.json
@@ -371,7 +378,17 @@ trainer:
     device: cpus
     eval_mode: false
     enable_segmentation: ${scratch.enable_segmentation} # Warning: Enable this if using segmentation.
+    # NOTE: SAM3 ViT uses RoPE/rel-pos that depend on img_size. For 384 training,
+    # pass image_size to avoid RoPE shape mismatch assertions.
+    image_size: ${scratch.resolution}
     checkpoint_path: /data/home/shujia/CardioSAM/sam3/sam3.pt
+    # Adapter 开关与参数
+    adapter_cfg:
+      enable_adapter: True
+      tuning_stage: "1234"
+      handcrafted_tune: true
+      embedding_tune: true
+      adaptor: "adaptor"
 
   meters:
     val:
@@ -430,7 +447,13 @@ trainer:
       - _target_: sam3.train.optim.optimizer.freeze_param_modifier
         _partial_: True
         apply_to:
-          - 'backbone.vision_backbone.*'
+          # 仅冻结 image encoder / text encoder，其它全部更新（含 adapter）
+          - 'backbone.vision_backbone.trunk.blocks.*'
+          - 'backbone.vision_backbone.trunk.patch_embed.*'
+          - 'backbone.vision_backbone.trunk.pos_embed'
+          - 'backbone.vision_backbone.trunk.class_embedding'
+          - 'backbone.vision_backbone.trunk.ln_pre.*'
+          - 'backbone.vision_backbone.trunk.ln_post.*'
           - 'backbone.language_backbone.*'
       - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
         _partial_: True
@@ -489,10 +512,10 @@ trainer:
     wandb_writer:
       _target_: sam3.train.utils.logger.make_wandb_logger
       project: acdc_sam3
-      name: acdc_image_ft #acdc_small_debug
+      name: acdc_adapter_392_bz4_single
       dir: ${launcher.experiment_log_dir}/wandb
       mode: online
-      tags: [acdc, sam3]
+      tags: [acdc, sam3, adapter, res392, single]
       should_log: True
       # ==================== 自定义添加：W&B 指标过滤（仅保留关键指标） ====================
       log_key_patterns:

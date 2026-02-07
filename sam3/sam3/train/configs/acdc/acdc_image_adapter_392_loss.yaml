@@ -5,7 +5,7 @@
 # ============================================================================
 paths:
   roboflow_vl_100_root: /data/home/shujia/CardioSAM
-  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_ft # /data/home/shujia/CardioSAM/outputs/test
+  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_adapter_392_loss # /data/home/shujia/CardioSAM/outputs/test
   bpe_path: /data/home/shujia/CardioSAM/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # Roboflow dataset configuration
@@ -30,7 +30,9 @@ roboflow_train:
           sizes:
             _target_: sam3.train.transforms.basic.get_random_resize_scales
             size: ${scratch.resolution}
-            min_size: 480
+            # NOTE: min_size must be <= resolution, otherwise sizes=[]
+            # and RandomResizeAPI will crash with "Cannot choose from an empty sequence".
+            min_size: 256
             rounded: false
           max_size:
             _target_: sam3.train.transforms.basic.get_random_resize_max_size
@@ -86,13 +88,13 @@ roboflow_train:
     loss_fns_find:
       - _target_: sam3.train.loss.loss_fns.Boxes
         weight_dict:
-          loss_bbox: 5.0
-          loss_giou: 2.0
+          loss_bbox: 1.0e-4
+          loss_giou: 1.0e-4
       - _target_: sam3.train.loss.loss_fns.IABCEMdetr
         weak_loss: False
         weight_dict:
-          loss_ce: 20.0
-          presence_loss: 20.0
+          loss_ce: 1.0e-4
+          presence_loss: 1.0e-4
         pos_weight: 10.0
         alpha: 0.25
         gamma: 2
@@ -217,7 +219,7 @@ scratch:
   scale_by_find_batch_size: True
 
   # Image processing parameters
-  resolution: 1008
+  resolution: 392
   consistent_transform: False
   max_ann_per_img: 200
 
@@ -307,7 +309,7 @@ trainer:
         img_folder: /data/home/shujia/CardioSAM/sam3input
         ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_train.json
 
-      shuffle: False
+      shuffle: True
       batch_size: ${scratch.train_batch_size}
       num_workers: ${scratch.num_train_workers}
       pin_memory: True
@@ -371,7 +373,17 @@ trainer:
     device: cpus
     eval_mode: false
     enable_segmentation: ${scratch.enable_segmentation} # Warning: Enable this if using segmentation.
+    # NOTE: SAM3 ViT uses RoPE/rel-pos that depend on img_size. For 384 training,
+    # pass image_size to avoid RoPE shape mismatch assertions.
+    image_size: ${scratch.resolution}
     checkpoint_path: /data/home/shujia/CardioSAM/sam3/sam3.pt
+    # Adapter 开关与参数
+    adapter_cfg:
+      enable_adapter: True
+      tuning_stage: "1234"
+      handcrafted_tune: true
+      embedding_tune: true
+      adaptor: "adaptor"
 
   meters:
     val:
@@ -430,7 +442,13 @@ trainer:
       - _target_: sam3.train.optim.optimizer.freeze_param_modifier
         _partial_: True
         apply_to:
-          - 'backbone.vision_backbone.*'
+          # 仅冻结 image encoder / text encoder，其它全部更新（含 adapter）
+          - 'backbone.vision_backbone.trunk.blocks.*'
+          - 'backbone.vision_backbone.trunk.patch_embed.*'
+          - 'backbone.vision_backbone.trunk.pos_embed'
+          - 'backbone.vision_backbone.trunk.class_embedding'
+          - 'backbone.vision_backbone.trunk.ln_pre.*'
+          - 'backbone.vision_backbone.trunk.ln_post.*'
           - 'backbone.language_backbone.*'
       - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
         _partial_: True
@@ -489,10 +507,10 @@ trainer:
     wandb_writer:
       _target_: sam3.train.utils.logger.make_wandb_logger
       project: acdc_sam3
-      name: acdc_image_ft #acdc_small_debug
+      name: acdc_adapter_392_loss #acdc_small_debug
       dir: ${launcher.experiment_log_dir}/wandb
       mode: online
-      tags: [acdc, sam3]
+      tags: [acdc, sam3, adapter, res392]
       should_log: True
       # ==================== 自定义添加：W&B 指标过滤（仅保留关键指标） ====================
       log_key_patterns:

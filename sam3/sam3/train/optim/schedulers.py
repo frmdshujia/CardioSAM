@@ -12,11 +12,13 @@ class InverseSquareRootParamScheduler:
         warmup_steps: int,
         cooldown_steps: int,
         timescale: int,
+        min_lr: float = 0.0,
     ):
         self.base_lr = base_lr
         self.warmup_steps = warmup_steps
         self.cooldown_steps = cooldown_steps
         self.timescale = timescale
+        self.min_lr = min_lr
 
     def __call__(self, step: int, where: float):
         lr = self.base_lr
@@ -39,5 +41,8 @@ class InverseSquareRootParamScheduler:
             lr = lr * min(1.0, step / self.warmup_steps)
         if self.cooldown_steps:
             lr = lr * min(1.0, (total_steps - step) / self.cooldown_steps)
+
+        if self.min_lr:
+            lr = max(lr, self.min_lr)
 
         return lr

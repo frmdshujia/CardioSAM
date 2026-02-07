@@ -324,11 +324,15 @@ class WandbLogger:
         pred_json_path: str,
         gt_json_path: str,
         img_root: str,
+        epoch: int,
         step: int,
     ) -> None:
         """
         从 COCO segm 预测文件中，取固定 N 个验证样本渲染 overlay 并上传到 W&B。
-        通过每次使用不同的 key（包含 epoch/step）来避免覆盖之前结果。
+        通过每次使用不同的 key（包含 epoch）来避免覆盖之前结果。
+
+        注意：W&B 的 `step` 必须全局单调递增，因此这里的 `step` 用于 W&B 的 x 轴，
+        `epoch` 仅用于 key/caption 标识当前 epoch。
         """
         if not self._enabled or self._wandb is None:
             return
@@ -514,14 +518,14 @@ class WandbLogger:
                 except Exception:
                     pass
 
-            caption = f"epoch={step} | {img_info.get('file_name', img_id)}"
+            caption = f"epoch={int(epoch)} | {img_info.get('file_name', img_id)}"
             wandb_images.append(self._wandb.Image(pred_canvas, caption=caption))
 
         if not wandb_images:
             return
 
         # 关键点：key 带 epoch，保证不覆盖历史结果
-        key = f"{key_prefix}/epoch_{int(step)}"
+        key = f"{key_prefix}/epoch_{int(epoch)}"
         self._wandb.log({key: wandb_images}, step=int(step))
     # ==================== 自定义添加结束 ====================
 
