@@ -1,0 +1,84 @@
+# @package _global_
+# Small-sample smoke test on sam3input_small (np_en_v1, 3 categories, noun_phrase prompts)
+defaults:
+  - acdc_image_no_adapter_280_bz8_ts350.yaml
+  - _self_
+
+paths:
+  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_small_no_adapter_280_bz2_ts50_np_en_v1
+
+scratch:
+  # make it fast for smoke testing
+  scheduler_timescale: 50
+  num_train_workers: 2
+  num_val_workers: 0
+
+trainer:
+  max_epochs: 2
+
+  data:
+    train:
+      batch_size: 2
+      dataset:
+        img_folder: /data/home/shujia/CardioSAM/sam3input_small
+        ann_file: /data/home/shujia/CardioSAM/sam3input_small/annotations/acdc_train_np_en_v1.json
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON_NOUN_PHRASE
+          include_negatives: true
+          category_chunk_size: 3
+          _partial_: true
+    val:
+      batch_size: 2
+      dataset:
+        img_folder: /data/home/shujia/CardioSAM/sam3input_small
+        ann_file: /data/home/shujia/CardioSAM/sam3input_small/annotations/acdc_val_np_en_v1.json
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON_NOUN_PHRASE
+          include_negatives: true
+          category_chunk_size: 3
+          _partial_: true
+    test:
+      batch_size: 2
+      dataset:
+        img_folder: /data/home/shujia/CardioSAM/sam3input_small
+        ann_file: /data/home/shujia/CardioSAM/sam3input_small/annotations/acdc_test_np_en_v1.json
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON_NOUN_PHRASE
+          include_negatives: true
+          category_chunk_size: 3
+          _partial_: true
+
+  meters:
+    val:
+      acdc:
+        segmentation:
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: /data/home/shujia/CardioSAM/sam3input_small/annotations/acdc_val_np_en_v1.json
+              tide: False
+              iou_type: "segm"
+            - _target_: sam3.eval.acdc_dice_eval.ACDCDiceEvaluator
+              gt_path: /data/home/shujia/CardioSAM/sam3input_small/annotations/acdc_val_np_en_v1.json
+              pred_score_thresh: 0.0
+    test:
+      acdc:
+        segmentation:
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: /data/home/shujia/CardioSAM/sam3input_small/annotations/acdc_test_np_en_v1.json
+              tide: False
+              iou_type: "segm"
+            - _target_: sam3.eval.acdc_dice_eval.ACDCDiceEvaluator
+              gt_path: /data/home/shujia/CardioSAM/sam3input_small/annotations/acdc_test_np_en_v1.json
+              pred_score_thresh: 0.0
+
+  logging:
+    wandb_writer:
+      name: acdc_small_no_adapter_280_bz2_ts50_np_en_v1
+      tags: [acdc, sam3, small, no_adapter, res280, ts50, np_en_v1]
+
+
+# CUDA_VISIBLE_DEVICES=0 \
+# python sam3/train/train.py -c configs/acdc/acdc_small_no_adapter_280_bz2_ts50_np_en_v1.yaml --use-cluster 0 --num-gpus 1 \
+# 2>&1 | tee /data/home/shujia/CardioSAM/outputs/acdc_small_no_adapter_280_bz2_ts50_np_en_v1/train.log
+

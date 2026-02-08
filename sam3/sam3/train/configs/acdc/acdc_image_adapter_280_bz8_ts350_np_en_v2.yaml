@@ -1,0 +1,76 @@
+# @package _global_
+# Inherit base adapter config (ts200), override:
+# - scheduler_timescale -> 350
+# - annotation files -> np_en_v2 (3 categories, pathology-aware per-annotation noun_phrase)
+# - output dir + wandb name/tags
+defaults:
+  - acdc_image_adapter_280_bz8_ts200.yaml
+  - _self_
+
+paths:
+  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_adapter_280_bz8_ts350_np_en_v2
+
+scratch:
+  scheduler_timescale: 350
+
+trainer:
+  data:
+    train:
+      dataset:
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON_NOUN_PHRASE
+          include_negatives: true
+          category_chunk_size: 3
+          _partial_: true
+        ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_train_np_en_v2.json
+    val:
+      dataset:
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON_NOUN_PHRASE
+          include_negatives: true
+          category_chunk_size: 3
+          _partial_: true
+        ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_val_np_en_v2.json
+    test:
+      dataset:
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON_NOUN_PHRASE
+          include_negatives: true
+          category_chunk_size: 3
+          _partial_: true
+        ann_file: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_test_np_en_v2.json
+
+  meters:
+    val:
+      acdc:
+        segmentation:
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_val_np_en_v2.json
+              tide: False
+              iou_type: "segm"
+            - _target_: sam3.eval.acdc_dice_eval.ACDCDiceEvaluator
+              gt_path: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_val_np_en_v2.json
+              pred_score_thresh: 0.0
+    test:
+      acdc:
+        segmentation:
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_test_np_en_v2.json
+              tide: False
+              iou_type: "segm"
+            - _target_: sam3.eval.acdc_dice_eval.ACDCDiceEvaluator
+              gt_path: /data/home/shujia/CardioSAM/sam3input/annotations/acdc_test_np_en_v2.json
+              pred_score_thresh: 0.0
+
+  logging:
+    wandb_writer:
+      name: acdc_adapter_280_bz8_ts350_np_en_v2
+      tags: [acdc, sam3, adapter, res280, ts350, np_en_v2]
+
+
+# TRITON_CACHE_DIR=/data/home/shujia/triton_cache CUDA_VISIBLE_DEVICES=2 \
+# python sam3/train/train.py -c configs/acdc/acdc_image_adapter_280_bz8_ts350_np_en_v2.yaml --use-cluster 0 --num-gpus 1 \
+# 2>&1 | tee /data/home/shujia/CardioSAM/outputs/acdc_adapter_280_bz8_ts350_np_en_v2/train.log
+

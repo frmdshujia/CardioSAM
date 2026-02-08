@@ -166,7 +166,9 @@ def map_scheduler_cfgs_to_param_groups(
     return schedulers, param_groups
 
 
-def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
+def validate_param_group_params(
+    param_groups: List[Dict], model: nn.Module, *, param_allowlist: Optional[Set[str]] = None
+):
     """Check that the param groups are non-overlapping and cover all the parameters.
 
     Args:
@@ -178,7 +180,11 @@ def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
         # no param should be repeated within a group
         assert len(pg["params"]) == len(set(pg["params"]))
     parameters = [set(param_group["params"]) for param_group in param_groups]
-    model_parameters = {parameter for _, parameter in model.named_parameters()}
+    if param_allowlist is None:
+        model_parameters = {parameter for _, parameter in model.named_parameters()}
+    else:
+        name_to_param = {name: p for name, p in model.named_parameters()}
+        model_parameters = {name_to_param[n] for n in param_allowlist if n in name_to_param}
     for p1, p2 in itertools.permutations(parameters, 2):
         assert p1.isdisjoint(p2), "Scheduler generated param_groups should be disjoint"
     assert set.union(*parameters) == model_parameters, (
@@ -325,14 +331,26 @@ def construct_optimizer(
     if param_allowlist is None:
         param_allowlist = {name for name, _ in model.named_parameters()}
 
-    named_parameters = {
-        name: param
-        for name, param in model.named_parameters()
-        if name in param_allowlist
-    }
+    named_parameters = {name: param for name, param in model.named_parameters() if name in param_allowlist}
 
     if not options_conf:
-        optimizer = hydra.utils.instantiate(optimizer_conf, named_parameters.values())
+        # Apply modifiers (e.g., freezing) before filtering trainable params.
+        if param_group_modifiers_conf:
+            for custom_param_modifier in param_group_modifiers_conf:
+                _ = hydra.utils.instantiate(custom_param_modifier)(
+                    scheduler_cfgs=[], model=model
+                )
+        effective_allowlist = {
+            name
+            for name, param in model.named_parameters()
+            if name in param_allowlist and param.requires_grad
+        }
+        effective_named_parameters = {
+            name: param for name, param in named_parameters.items() if name in effective_allowlist
+        }
+        if len(effective_named_parameters) == 0:
+            raise ValueError("No trainable parameters left after applying param_group_modifiers.")
+        optimizer = hydra.utils.instantiate(optimizer_conf, effective_named_parameters.values())
         return Optimizer(optimizer)
 
     all_parameter_names = {
@@ -359,11 +377,22 @@ def construct_optimizer(
             all_scheduler_cfgs = custom_param_modifier(
                 scheduler_cfgs=all_scheduler_cfgs, model=model
             )
+
+    # Restrict optimizer state to trainable parameters only (avoid frozen optimizer states).
+    effective_allowlist = {
+        name
+        for name, param in model.named_parameters()
+        if name in param_allowlist and param.requires_grad
+    }
+    if len(effective_allowlist) == 0:
+        raise ValueError("No trainable parameters left after applying param_group_modifiers.")
+    named_parameters = {name: param for name, param in named_parameters.items() if name in effective_allowlist}
+
     schedulers, param_groups = map_scheduler_cfgs_to_param_groups(
         all_scheduler_cfgs, named_parameters
     )
     if validate_param_groups:
-        validate_param_group_params(param_groups, model)
+        validate_param_group_params(param_groups, model, param_allowlist=effective_allowlist)
     optimizer = hydra.utils.instantiate(optimizer_conf, param_groups)
     return Optimizer(optimizer, schedulers)
 
@@ -522,4 +551,31 @@ def freeze_param_modifier(
         )
     else:
         logging.warning("freeze_param_modifier matched no params: %s", patterns)
+    return scheduler_cfgs
+
+
+def unfreeze_param_modifier(
+    scheduler_cfgs: List[List[Dict]],
+    model: nn.Module,
+    apply_to: Union[str, Iterable[str]],
+) -> List[List[Dict]]:
+    """
+    Unfreezes parameters by setting requires_grad=True for matching patterns.
+    Useful to re-enable small modules (e.g., adapters) after freezing a larger submodule.
+    Returns scheduler_cfgs unchanged so validation still sees full coverage.
+    """
+    patterns = [apply_to] if isinstance(apply_to, str) else list(apply_to)
+    unfrozen = []
+    for name, param in model.named_parameters():
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+            param.requires_grad = True
+            unfrozen.append(name)
+    if unfrozen:
+        logging.info(
+            "unfreeze_param_modifier unfroze %d params, examples: %s",
+            len(unfrozen),
+            ", ".join(unfrozen[:5]),
+        )
+    else:
+        logging.warning("unfreeze_param_modifier matched no params: %s", patterns)
     return scheduler_cfgs

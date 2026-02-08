@@ -493,7 +493,7 @@ def build_tracker(
     return model
 
 
-def _create_text_encoder(bpe_path: str) -> VETextEncoder:
+def _create_text_encoder(bpe_path: str, *, text_adapter_cfg=None) -> VETextEncoder:
     """Create SAM3 text encoder."""
     tokenizer = SimpleTokenizer(bpe_path=bpe_path)
     return VETextEncoder(
@@ -502,6 +502,7 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
         width=1024,
         heads=16,
         layers=24,
+        text_adapter_cfg=text_adapter_cfg,
     )
 
 
@@ -584,6 +585,7 @@ def build_sam3_image_model(
     enable_inst_interactivity=False,
     compile=False,
     adapter_cfg=None,
+    text_adapter_cfg=None,
     image_size: int = 1008,
 ):
     """
@@ -616,7 +618,7 @@ def build_sam3_image_model(
     )
 
     # Create text components
-    text_encoder = _create_text_encoder(bpe_path)
+    text_encoder = _create_text_encoder(bpe_path, text_adapter_cfg=text_adapter_cfg)
 
     # Create visual-language backbone
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
@@ -659,6 +661,26 @@ def build_sam3_image_model(
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
 
+    # If text adapter is enabled, freeze language backbone except adapter params.
+    # This avoids full text-encoder finetuning while allowing adapter training.
+    try:
+        enable_text_adapter = False
+        if text_adapter_cfg is not None:
+            if hasattr(text_adapter_cfg, "get"):
+                enable_text_adapter = bool(text_adapter_cfg.get("enable_adapter", False))
+            else:
+                enable_text_adapter = bool(getattr(text_adapter_cfg, "enable_adapter", False))
+        if enable_text_adapter:
+            for name, param in model.named_parameters():
+                if not name.startswith("backbone.language_backbone."):
+                    continue
+                if ".adapter." in name or ".adapter" in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+    except Exception:
+        pass
+
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
 
@@ -686,6 +708,7 @@ def build_sam3_video_model(
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
     adapter_cfg=None,
+    text_adapter_cfg=None,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -710,7 +733,7 @@ def build_sam3_video_model(
 
     # Build Detector components
     visual_neck = _create_vision_backbone(adapter_cfg=adapter_cfg)
-    text_encoder = _create_text_encoder(bpe_path)
+    text_encoder = _create_text_encoder(bpe_path, text_adapter_cfg=text_adapter_cfg)
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
     transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
     segmentation_head: UniversalSegmentationHead = _create_segmentation_head()

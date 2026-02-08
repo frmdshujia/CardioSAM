@@ -3,13 +3,50 @@
 # pyre-unsafe
 
 from collections import OrderedDict
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .model_misc import LayerScale
+
+
+class BottleneckAdapter(nn.Module):
+    """
+    A simple bottleneck adapter: x + scale * Up(Dropout(GELU(Down(LN(x)))))
+    Initialize Up to zeros to start as a no-op.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        adapter_dim: int = 32,
+        dropout: float = 0.0,
+        scale: float = 1.0,
+        act_layer: Callable[[], nn.Module] = nn.GELU,
+        norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
+    ):
+        super().__init__()
+        self.ln = norm_layer(d_model)
+        self.down = nn.Linear(d_model, adapter_dim)
+        self.act = act_layer()
+        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.up = nn.Linear(adapter_dim, d_model)
+        self.scale = float(scale)
+
+        # Start from no-op to preserve pretrained behavior at init.
+        nn.init.zeros_(self.up.weight)
+        if self.up.bias is not None:
+            nn.init.zeros_(self.up.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.ln(x)
+        y = self.down(y)
+        y = self.act(y)
+        y = self.dropout(y)
+        y = self.up(y)
+        return x + y * self.scale
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -21,8 +58,11 @@ class ResidualAttentionBlock(nn.Module):
         ls_init_value: Optional[float] = None,
         act_layer: Callable[[], nn.Module] = nn.GELU,
         norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
+        adapter_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
+        adapter_cfg = adapter_cfg or {}
+        self.enable_adapter = bool(adapter_cfg.get("enable_adapter", False))
         # Attention
         self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
 
@@ -51,6 +91,20 @@ class ResidualAttentionBlock(nn.Module):
                     ("c_proj", nn.Linear(mlp_width, d_model)),
                 ]
             )
+        )
+
+        # Text adapter (optional)
+        self.adapter = (
+            BottleneckAdapter(
+                d_model=d_model,
+                adapter_dim=int(adapter_cfg.get("adapter_dim", 32)),
+                dropout=float(adapter_cfg.get("adapter_dropout", 0.0)),
+                scale=float(adapter_cfg.get("adapter_scale", 1.0)),
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+            )
+            if self.enable_adapter
+            else None
         )
 
     def attention(
@@ -86,6 +140,8 @@ class ResidualAttentionBlock(nn.Module):
             self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask)
         )
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
+        if self.adapter is not None:
+            x = self.adapter(x)
         return x
 
 
@@ -101,6 +157,7 @@ class Transformer(nn.Module):
         norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
         compile_mode: Optional[str] = None,
         use_act_checkpoint: bool = False,
+        adapter_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.width = width
@@ -115,6 +172,7 @@ class Transformer(nn.Module):
                     ls_init_value=ls_init_value,
                     act_layer=act_layer,
                     norm_layer=norm_layer,
+                    adapter_cfg=adapter_cfg,
                 )
                 for _ in range(layers)
             ]
@@ -183,6 +241,7 @@ class TextTransformer(nn.Module):
         use_ln_post: bool = True,
         compile_mode: Optional[str] = None,
         use_act_checkpoint: bool = False,
+        adapter_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         assert pool_type in ("first", "last", "argmax", "none")
@@ -206,6 +265,7 @@ class TextTransformer(nn.Module):
             norm_layer=norm_layer,
             compile_mode=compile_mode,
             use_act_checkpoint=use_act_checkpoint,
+            adapter_cfg=adapter_cfg,
         )
         self.ln_final = norm_layer(width) if use_ln_post else nn.Identity()
         if no_causal_mask:
@@ -265,6 +325,7 @@ class VETextEncoder(nn.Module):
         use_ln_post: bool = True,
         compile_mode: Optional[str] = None,
         use_act_checkpoint: bool = True,
+        text_adapter_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.context_length = context_length
@@ -282,6 +343,7 @@ class VETextEncoder(nn.Module):
             use_ln_post=use_ln_post,
             compile_mode=compile_mode,
             use_act_checkpoint=use_act_checkpoint,
+            adapter_cfg=text_adapter_cfg,
         )
         self.resizer = nn.Linear(self.encoder.width, d_model)
 

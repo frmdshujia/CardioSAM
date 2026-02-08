@@ -275,6 +275,135 @@ class COCO_FROM_JSON:
         return images
 
 
+# ----------------------------------------------------------------------------
+# Variant: use per-annotation noun_phrase for query_text (positives only)
+# ----------------------------------------------------------------------------
+class COCO_FROM_JSON_NOUN_PHRASE(COCO_FROM_JSON):
+    """
+    Same as COCO_FROM_JSON, but for categories that have at least one instance in the image,
+    the query_text is taken from the first available annotation's `noun_phrase` field.
+
+    This enables "keep categories fixed (e.g., 3 anatomies), but vary text prompts per patient/image".
+    For negative queries (no instances), it falls back to the category name (or prompts override).
+    """
+
+    def __init__(
+        self,
+        annotation_file,
+        prompts=None,
+        include_negatives=True,
+        category_chunk_size=None,
+        noun_phrase_field: str = "noun_phrase",
+        use_noun_phrase_for_positives: bool = True,
+    ):
+        super().__init__(
+            annotation_file=annotation_file,
+            prompts=prompts,
+            include_negatives=include_negatives,
+            category_chunk_size=category_chunk_size,
+        )
+        self.noun_phrase_field = noun_phrase_field
+        self.use_noun_phrase_for_positives = use_noun_phrase_for_positives
+
+    def loadQueriesAndAnnotationsFromDatapoint(self, idx):
+        img_idx = idx // len(self.category_chunks)
+        chunk_idx = idx % len(self.category_chunks)
+        cat_chunk = self.category_chunks[chunk_idx]
+
+        queries = []
+        annotations = []
+
+        query_template = {
+            "id": None,
+            "original_cat_id": None,
+            "object_ids_output": None,
+            "query_text": None,
+            "query_processing_order": 0,
+            "ptr_x_query_id": None,
+            "ptr_y_query_id": None,
+            "image_id": 0,  # Single image per datapoint
+            "input_box": None,
+            "input_box_label": None,
+            "input_points": None,
+            "is_exhaustive": True,
+        }
+
+        annot_template = {
+            "image_id": 0,
+            "bbox": None,  # Normalized bbox in xywh
+            "area": None,  # Unnormalized area
+            "segmentation": None,  # RLE encoded
+            "object_id": None,
+            "is_crowd": None,
+            "id": None,
+        }
+
+        raw_annotations = self._raw_data[img_idx]["annotations"]
+        image_info = self._raw_data[img_idx]["image"]
+        width, height = image_info["width"], image_info["height"]
+
+        cat_id_to_anns = defaultdict(list)
+        for ann in raw_annotations:
+            cat_id_to_anns[ann["category_id"]].append(ann)
+
+        annotations_by_cat_sorted = [
+            (cat_id, cat_id_to_anns[cat_id]) for cat_id in cat_chunk
+        ]
+
+        for cat_id, anns in annotations_by_cat_sorted:
+            if len(anns) == 0 and not self.include_negatives:
+                continue
+
+            cur_ann_ids = []
+
+            for ann in anns:
+                annotation = annot_template.copy()
+                annotation["id"] = len(annotations)
+                annotation["object_id"] = annotation["id"]
+                annotation["is_crowd"] = ann["iscrowd"]
+
+                normalized_boxes = convert_boxlist_to_normalized_tensor(
+                    [ann["bbox"]], width, height
+                )
+                bbox = normalized_boxes[0]
+                annotation["area"] = (bbox[2] * bbox[3]).item()
+                annotation["bbox"] = bbox
+
+                if (
+                    "segmentation" in ann
+                    and ann["segmentation"] is not None
+                    and ann["segmentation"] != []
+                ):
+                    annotation["segmentation"] = ann_to_rle(
+                        ann["segmentation"], im_info=image_info
+                    )
+
+                annotations.append(annotation)
+                cur_ann_ids.append(annotation["id"])
+
+            base_text = (
+                self._cat_idx_to_text[cat_id]
+                if self.prompts is None
+                else self.prompts[cat_id]
+            )
+            np_text = None
+            if self.use_noun_phrase_for_positives and len(anns) > 0:
+                for ann in anns:
+                    val = ann.get(self.noun_phrase_field, None)
+                    if val:
+                        np_text = str(val)
+                        break
+
+            query = query_template.copy()
+            query["id"] = len(queries)
+            query["original_cat_id"] = cat_id
+            query["query_text"] = np_text if np_text is not None else base_text
+            query["object_ids_output"] = cur_ann_ids
+            queries.append(query)
+
+        return queries, annotations
+
+
 # ============================================================================
 # SAM3 Evaluation APIs
 # ============================================================================

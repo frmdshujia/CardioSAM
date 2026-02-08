@@ -1,0 +1,57 @@
+# @package _global_
+# Small-sample smoke test on sam3input_small:
+# - np_en_v2 (3 categories, noun_phrase prompts)
+# - image adapter ON
+# - text adapter ON
+defaults:
+  - acdc_small_no_adapter_280_bz2_ts50_np_en_v2.yaml
+  - _self_
+
+paths:
+  experiment_log_dir: /data/home/shujia/CardioSAM/outputs/acdc_small_both_adapters_280_bz2_ts50_np_en_v2
+
+trainer:
+  model:
+    adapter_cfg:
+      enable_adapter: True
+    text_adapter_cfg:
+      enable_adapter: True
+      adapter_dim: 32
+      adapter_dropout: 0.1
+      adapter_scale: 1.0
+
+  optim:
+    # Base config freezes the whole language backbone; re-enable text adapter params.
+    param_group_modifiers:
+      - _target_: sam3.train.optim.optimizer.freeze_param_modifier
+        _partial_: True
+        apply_to:
+          - 'backbone.vision_backbone.trunk.blocks.*'
+          - 'backbone.vision_backbone.trunk.patch_embed.*'
+          - 'backbone.vision_backbone.trunk.pos_embed'
+          - 'backbone.vision_backbone.trunk.class_embedding'
+          - 'backbone.vision_backbone.trunk.ln_pre.*'
+          - 'backbone.vision_backbone.trunk.ln_post.*'
+          - 'backbone.language_backbone.*'
+      - _target_: sam3.train.optim.optimizer.unfreeze_param_modifier
+        _partial_: True
+        apply_to:
+          - 'backbone.language_backbone.*adapter*'
+      - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
+        _partial_: True
+        layer_decay_value: ${scratch.lrd_vision_backbone}
+        apply_to: 'backbone.vision_backbone.trunk'
+        overrides:
+          - pattern: '*pos_embed*'
+            value: 1.0
+
+  logging:
+    wandb_writer:
+      name: acdc_small_both_adapters_280_bz2_ts50_np_en_v2
+      tags: [acdc, sam3, small, adapter, text_adapter, res280, ts50, np_en_v2]
+
+
+# CUDA_VISIBLE_DEVICES=0 \
+# python sam3/train/train.py -c configs/acdc/acdc_small_both_adapters_280_bz2_ts50_np_en_v2.yaml --use-cluster 0 --num-gpus 1 \
+# 2>&1 | tee /data/home/shujia/CardioSAM/outputs/acdc_small_both_adapters_280_bz2_ts50_np_en_v2/train.log
+
