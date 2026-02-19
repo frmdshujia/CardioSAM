@@ -280,6 +280,35 @@ def load_gt_volume(patient_dir: Path, patient_id: str, frame_idx: int):
     return nib.load(str(gt_path)).get_fdata()
 
 
+def get_voxel_spacing(patient_dir: Path, patient_id: str, frame_files):
+    """
+    从 .nii.gz 头信息读取体素间距。
+    优先从 4D 文件读取，否则从第一帧读取。
+    返回 dict: {pixel_spacing_mm: [x, y], slice_thickness_mm: z}
+    """
+    fourd_path = patient_dir / f"{patient_id}_4d.nii.gz"
+    if fourd_path.exists():
+        img = nib.load(str(fourd_path))
+        zooms = img.header.get_zooms()
+        # zooms for 4D: (x, y, z, t)
+        return {
+            "pixel_spacing_mm": [float(zooms[0]), float(zooms[1])],
+            "slice_thickness_mm": float(zooms[2]),
+        }
+    if frame_files:
+        _, first_path = frame_files[0]
+        img = nib.load(str(first_path))
+        zooms = img.header.get_zooms()
+        return {
+            "pixel_spacing_mm": [float(zooms[0]), float(zooms[1])],
+            "slice_thickness_mm": float(zooms[2]),
+        }
+    return {
+        "pixel_spacing_mm": [1.0, 1.0],
+        "slice_thickness_mm": 1.0,
+    }
+
+
 def prepare_patient(
     patient_dir: Path,
     output_root: Path,
@@ -311,6 +340,9 @@ def prepare_patient(
     out_masks_vis_root = out_patient_root / "masks_vis"
     out_videos_root = out_patient_root / "videos"
     fourd_path = patient_dir / f"{patient_id}_4d.nii.gz"
+
+    # 获取体素间距元数据
+    spacing_meta = get_voxel_spacing(patient_dir, patient_id, frame_files)
 
     if use_4d_for_video and fourd_path.exists():
         vmin, vmax = estimate_intensity_range_4d(
@@ -367,19 +399,34 @@ def prepare_patient(
         out_videos_root.mkdir(parents=True, exist_ok=True)
         ordered = sorted(video_frames, key=lambda x: x[0])
         num_frames = len(ordered)
+        # 构建帧序号映射：导出 frame 序号 -> 原始 4D 时间帧索引
+        frame_index_map = {idx: orig_frame_idx for idx, (orig_frame_idx, _) in enumerate(ordered)}
+        exported_slices = []
         for z in slice_indices(z_dim, slice_stride, max_slices):
             slice_dir = out_videos_root / f"slice_{z:02d}"
             slice_dir.mkdir(parents=True, exist_ok=True)
             for idx, (frame_idx, volume_u8) in enumerate(ordered):
                 out_path = slice_dir / f"frame_{idx:02d}.png"
                 save_slice_image(volume_u8[..., z], out_path)
+            exported_slices.append(f"slice_{z:02d}")
+    else:
+        frame_index_map = {}
+        exported_slices = []
+
+    # 计算视频实际帧数（4D帧数 vs 仅含ED/ES的帧数）
+    video_num_frames = len(video_frames) if video_frames else len(frame_files)
 
     meta = {
         "patient_id": patient_id,
         "split": split,
         "num_frames": len(frame_files),
+        "video_num_frames": video_num_frames,
         "ed_frame": ed_frame,
         "es_frame": es_frame,
+        "ed_frame_export_idx": None,  # 将在下方填充
+        "es_frame_export_idx": None,
+        "frame_index_map": frame_index_map,
+        "exported_video_slices": exported_slices,
         "slice_stride": slice_stride,
         "max_slices": max_slices,
         "percentile_low": percentile_low,
@@ -389,7 +436,16 @@ def prepare_patient(
         "exported_gt": not skip_gt,
         "exported_gt_vis": not skip_gt_vis,
         "use_4d_for_video": use_4d_for_video,
+        **spacing_meta,
     }
+
+    # 填充 ED/ES 在导出帧序列中的索引
+    # ACDC ed_frame/es_frame 是 1-indexed（frame01=1），而 4D 导出帧为 0-indexed（t=0 对应 frame01）
+    if frame_index_map:
+        inv_map = {v: k for k, v in frame_index_map.items()}
+        meta["ed_frame_export_idx"] = inv_map.get(ed_frame - 1) if ed_frame is not None else None
+        meta["es_frame_export_idx"] = inv_map.get(es_frame - 1) if es_frame is not None else None
+
     out_patient_root.mkdir(parents=True, exist_ok=True)
     with (out_patient_root / "meta.json").open("w") as f:
         json.dump(meta, f, indent=2)
