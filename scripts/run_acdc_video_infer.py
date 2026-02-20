@@ -23,9 +23,14 @@ run_acdc_video_infer.py
     --manifest outputs/annotations/acdc_video_split_manifest.json \\
     --checkpoint outputs/acdc_adapter_280_bz8_ts350/checkpoints/checkpoint_50.pt \\
     --checkpoint_type adapter \\
+    --base_checkpoint sam3/sam3.pt \\
     --output_root outputs/acdc_video_infer_adapter \\
-    --split val \\
+    --split test \\
     --prompt "left ventricle"
+
+  注：adapter 推理始终在 image_size=1008 下运行（与 baseline 一致），保证 tracker
+  权重（来自 --base_checkpoint）与 backbone 输出特征尺寸匹配。PromptGenerator 通过
+  双线性插值适配 1008px 推理，无需与训练分辨率（280px）一致。
 
 使用示例（baseline）：
   python scripts/run_acdc_video_infer.py \\
@@ -33,7 +38,7 @@ run_acdc_video_infer.py
     --checkpoint sam3/sam3.pt \\
     --checkpoint_type baseline \\
     --output_root outputs/acdc_video_infer_baseline \\
-    --split val
+    --split test
 """
 
 import argparse
@@ -93,24 +98,75 @@ def load_adapted_checkpoint(checkpoint_path: str, checkpoint_type: str, strict: 
 # 视频预测器构建（复用 run_baseline_video.py 的思路）
 # ---------------------------------------------------------------------------
 
-def build_predictor(checkpoint_path: str, checkpoint_type: str, device: str):
+def build_predictor(
+    checkpoint_path: str,
+    checkpoint_type: str,
+    device: str,
+    image_size: int = 1008,
+    base_checkpoint: str = None,
+):
     """
     构建 Sam3VideoPredictorMultiGPU，加载权重，返回 predictor。
+
+    adapter 模式加载策略（两阶段）：
+      1. 先加载 base_checkpoint（如 sam3/sam3.pt），初始化 tracker 和 backbone
+         基础权重（不含 prompt_generator），使 tracker 可以正常工作。
+      2. 再叠加 adapter checkpoint（含 prompt_generator + 微调后的 transformer
+         / segmentation_head），覆盖 detector 部分权重。
+
+    PromptGenerator 虽在 280px 下训练，但其内部用 _resize_handcrafted 做双线性
+    插值，可在 1008px 推理时正常运行（空间频率略有差异，但不影响功能）。
+
+    baseline 模式：直接加载 sam3.pt，无需两阶段处理。
     """
+    import torch
     from sam3.model_builder import build_sam3_video_predictor
 
-    # 先不传 checkpoint 路径（默认不加载），手动加载以便做前缀适配
-    # Sam3VideoPredictor 不接受 device 参数，固定使用 .cuda()
-    predictor = build_sam3_video_predictor(checkpoint_path=None)
+    adapter_cfg = None
+    if checkpoint_type == "adapter":
+        adapter_cfg = {
+            "enable_adapter": True,
+            "tuning_stage": "1234",
+            "handcrafted_tune": True,
+            "embedding_tune": True,
+            "adaptor": "adaptor",
+        }
 
-    print(f"[ckpt] Loading checkpoint: {checkpoint_path}  (type={checkpoint_type})")
+    # 始终在 image_size=1008 下构建模型，保证 tracker 与 backbone 特征尺寸一致
+    # （tracker.sam_image_embedding_size = 1008 // 14 = 72）
+    effective_image_size = 1008
+    if checkpoint_type == "baseline":
+        effective_image_size = image_size  # baseline 可自定义
+
+    predictor = build_sam3_video_predictor(
+        checkpoint_path=None,
+        adapter_cfg=adapter_cfg,
+        image_size=effective_image_size,
+    )
+
+    print(f"[ckpt] Checkpoint       : {checkpoint_path}")
+    print(f"[ckpt] Type             : {checkpoint_type}")
+    print(f"[ckpt] Model image_size : {effective_image_size}")
+    print(f"[ckpt] Adapter enabled  : {adapter_cfg is not None}")
+
+    # ── 阶段 1：adapter 模式先加载 base checkpoint 初始化 tracker ──────────────
+    if checkpoint_type == "adapter" and base_checkpoint:
+        print(f"[ckpt] Loading base checkpoint for tracker init: {base_checkpoint}")
+        base_ckpt = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
+        if "model" in base_ckpt and isinstance(base_ckpt["model"], dict):
+            base_ckpt = base_ckpt["model"]
+        base_ckpt = {k: v for k, v in base_ckpt.items() if "freqs_cis" not in k}
+        miss_b, unexp_b = predictor.model.load_state_dict(base_ckpt, strict=False)
+        print(f"[ckpt]   Base  missing={len(miss_b)}, unexpected={len(unexp_b)}")
+    elif checkpoint_type == "adapter":
+        print("[ckpt] WARNING: no --base_checkpoint provided; tracker will be randomly "
+              "initialized and propagation quality will be poor.")
+
+    # ── 阶段 2：加载目标 checkpoint（adapter 或 baseline）──────────────────────
     adapted_dict = load_adapted_checkpoint(checkpoint_path, checkpoint_type)
-
     missing, unexpected = predictor.model.load_state_dict(adapted_dict, strict=False)
-    print(f"[ckpt] Missing keys : {len(missing)}")
-    print(f"[ckpt] Unexpected keys: {len(unexpected)}")
+    print(f"[ckpt] Adapter/target  missing={len(missing)}, unexpected={len(unexpected)}")
     if missing:
-        # 仅打印前 20 条
         print("       (first 20 missing):", missing[:20])
     if unexpected:
         print("       (first 20 unexpected):", unexpected[:20])
@@ -162,7 +218,10 @@ def run_single_video(
             }
         )
     except Exception as e:
-        print(f"  [ERROR] add_prompt failed: {e}")
+        import traceback as _tb
+        print(f"  [ERROR] add_prompt failed: {type(e).__name__}: {e}")
+        print("  [ERROR] Full traceback:")
+        _tb.print_exc()
         predictor.handle_request({"type": "close_session", "session_id": session_id})
         return False, 0
 
@@ -482,6 +541,24 @@ def parse_args():
         help="Optional patient filter (e.g. patient001 patient002).",
     )
     parser.add_argument(
+        "--image_size",
+        type=int,
+        default=1008,
+        help=(
+            "Inference image size (default: 1008). For adapter type this is ignored "
+            "and always set to 1008 to keep tracker compatible with sam3.pt weights."
+        ),
+    )
+    parser.add_argument(
+        "--base_checkpoint",
+        default=None,
+        help=(
+            "Path to baseline sam3.pt, used as Phase-1 weight initialization for "
+            "adapter inference (initializes tracker + backbone before loading adapter). "
+            "Recommended: sam3/sam3.pt. If omitted, tracker will be randomly initialized."
+        ),
+    )
+    parser.add_argument(
         "--device",
         default="cuda",
         help="Device (default: cuda).",
@@ -530,7 +607,13 @@ def main():
     print()
 
     # 构建预测器（加载 checkpoint）
-    predictor = build_predictor(args.checkpoint, args.checkpoint_type, args.device)
+    predictor = build_predictor(
+        args.checkpoint,
+        args.checkpoint_type,
+        args.device,
+        image_size=args.image_size,
+        base_checkpoint=args.base_checkpoint,
+    )
 
     # 保存推理配置到输出目录
     config = {

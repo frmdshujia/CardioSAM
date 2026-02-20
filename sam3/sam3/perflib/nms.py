@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 import logging
+import os
 
 import numpy as np
 import torch
@@ -53,6 +54,10 @@ def nms_masks(
     return keep
 
 
+# Set SAM3_USE_CPU_NMS=1 to bypass Triton NMS (use when "0 active drivers" on remote/container)
+_USE_CPU_NMS = os.environ.get("SAM3_USE_CPU_NMS", "").strip().lower() in ("1", "true", "yes")
+
+
 def generic_nms(
     ious: torch.Tensor, scores: torch.Tensor, iou_threshold=0.5
 ) -> torch.Tensor:
@@ -61,13 +66,22 @@ def generic_nms(
     assert ious.dim() == 2 and ious.size(0) == ious.size(1)
     assert scores.dim() == 1 and scores.size(0) == ious.size(0)
 
-    if ious.is_cuda:
+    if ious.is_cuda and not _USE_CPU_NMS:
         if GENERIC_NMS_AVAILABLE:
             return generic_nms_cuda(ious, scores, iou_threshold, use_iou_matrix=True)
         else:
-            from sam3.perflib.triton.nms import nms_triton
+            try:
+                from sam3.perflib.triton.nms import nms_triton
 
-            return nms_triton(ious, scores, iou_threshold)
+                return nms_triton(ious, scores, iou_threshold)
+            except RuntimeError as e:
+                if "active drivers" in str(e) or "0 active drivers" in str(e):
+                    logging.warning(
+                        f"Triton NMS failed (no active GPU driver): {e}. "
+                        "Falling back to CPU NMS. Set SAM3_USE_CPU_NMS=1 to skip Triton permanently."
+                    )
+                    return generic_nms_cpu(ious, scores, iou_threshold)
+                raise
 
     return generic_nms_cpu(ious, scores, iou_threshold)
 

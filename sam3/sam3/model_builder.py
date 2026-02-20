@@ -709,6 +709,7 @@ def build_sam3_video_model(
     compile=False,
     adapter_cfg=None,
     text_adapter_cfg=None,
+    image_size: int = 1008,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -732,7 +733,7 @@ def build_sam3_video_model(
     )
 
     # Build Detector components
-    visual_neck = _create_vision_backbone(adapter_cfg=adapter_cfg)
+    visual_neck = _create_vision_backbone(adapter_cfg=adapter_cfg, image_size=image_size)
     text_encoder = _create_text_encoder(bpe_path, text_adapter_cfg=text_adapter_cfg)
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
     transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
@@ -789,7 +790,7 @@ def build_sam3_video_model(
             recondition_every_nth_frame=16,
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
-            image_size=1008,
+            image_size=image_size,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
             compile_model=compile,
@@ -816,7 +817,7 @@ def build_sam3_video_model(
             recondition_every_nth_frame=0,
             masklet_confirmation_enable=False,
             decrease_trk_keep_alive_for_empty_masklets=False,
-            image_size=1008,
+            image_size=image_size,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
             compile_model=compile,
