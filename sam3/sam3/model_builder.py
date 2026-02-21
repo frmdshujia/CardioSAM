@@ -332,20 +332,29 @@ def _create_sam3_model(
     return model
 
 
-def _create_tracker_maskmem_backbone():
-    """Create the SAM3 Tracker memory encoder."""
+def _create_tracker_maskmem_backbone(image_size: int = 1008):
+    """Create the SAM3 Tracker memory encoder.
+
+    interpol_size is set so that after total_stride=16 downsampling, the mask
+    feature spatial dimension matches the backbone feature size (image_size // 14).
+    """
+    backbone_stride = 14
+    maskmem_total_stride = 16
+    feat_size = image_size // backbone_stride          # 72 @ 1008, 20 @ 280
+    maskmem_interpol = feat_size * maskmem_total_stride  # 1152 @ 1008, 320 @ 280
+
     # Position encoding for mask memory backbone
     position_encoding = PositionEmbeddingSine(
         num_pos_feats=64,
         normalize=True,
         scale=None,
         temperature=10000,
-        precompute_resolution=1008,
+        precompute_resolution=maskmem_interpol,
     )
 
     # Mask processing components
     mask_downsampler = SimpleMaskDownSampler(
-        kernel_size=3, stride=2, padding=1, interpol_size=[1152, 1152]
+        kernel_size=3, stride=2, padding=1, interpol_size=[maskmem_interpol, maskmem_interpol]
     )
 
     cx_block_layer = CXBlock(
@@ -438,6 +447,7 @@ def build_tracker(
     with_backbone: bool = False,
     compile_mode=None,
     adapter_cfg=None,
+    image_size: int = 1008,
 ) -> Sam3TrackerPredictor:
     """
     Build the SAM3 Tracker module for video tracking.
@@ -447,7 +457,7 @@ def build_tracker(
     """
 
     # Create model components
-    maskmem_backbone = _create_tracker_maskmem_backbone()
+    maskmem_backbone = _create_tracker_maskmem_backbone(image_size=image_size)
     transformer = _create_tracker_transformer()
     backbone = None
     if with_backbone:
@@ -457,7 +467,7 @@ def build_tracker(
         backbone = SAM3VLBackbone(scalp=1, visual=vision_backbone, text=None)
     # Create the Tracker module
     model = Sam3TrackerPredictor(
-        image_size=1008,
+        image_size=image_size,
         num_maskmem=7,
         backbone=backbone,
         backbone_stride=14,
@@ -730,6 +740,7 @@ def build_sam3_video_model(
     tracker = build_tracker(
         apply_temporal_disambiguation=apply_temporal_disambiguation,
         adapter_cfg=adapter_cfg,
+        image_size=image_size,
     )
 
     # Build Detector components

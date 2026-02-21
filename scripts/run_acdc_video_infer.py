@@ -68,7 +68,7 @@ def load_adapted_checkpoint(checkpoint_path: str, checkpoint_type: str, strict: 
     import torch
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    if checkpoint_type == "adapter":
+    if checkpoint_type in ("adapter", "no_adapter"):
         # 取出 model 字段
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             model_dict = ckpt["model"]
@@ -91,7 +91,7 @@ def load_adapted_checkpoint(checkpoint_path: str, checkpoint_type: str, strict: 
         return sd
 
     else:
-        raise ValueError(f"Unknown checkpoint_type: {checkpoint_type!r}. Use 'adapter' or 'baseline'.")
+        raise ValueError(f"Unknown checkpoint_type: {checkpoint_type!r}. Use 'adapter', 'no_adapter', or 'baseline'.")
 
 
 # ---------------------------------------------------------------------------
@@ -131,26 +131,32 @@ def build_predictor(
             "embedding_tune": True,
             "adaptor": "adaptor",
         }
+    elif checkpoint_type == "no_adapter":
+        # 直接微调（无 adapter 层），但保留 PromptGenerator（handcrafted_tune/embedding_tune）
+        adapter_cfg = {
+            "enable_adapter": False,
+            "tuning_stage": "1234",
+            "handcrafted_tune": True,
+            "embedding_tune": True,
+            "adaptor": "adaptor",
+        }
 
-    # 始终在 image_size=1008 下构建模型，保证 tracker 与 backbone 特征尺寸一致
-    # （tracker.sam_image_embedding_size = 1008 // 14 = 72）
-    effective_image_size = 1008
-    if checkpoint_type == "baseline":
-        effective_image_size = image_size  # baseline 可自定义
-
+    # 使用传入的 image_size 构建模型，detector 与 tracker 的特征尺寸保持一致
+    # adapter/no_adapter 模式：image_size=280 → sam_image_embedding_size=20
+    # baseline 模式：image_size=1008（默认）→ sam_image_embedding_size=72
     predictor = build_sam3_video_predictor(
         checkpoint_path=None,
         adapter_cfg=adapter_cfg,
-        image_size=effective_image_size,
+        image_size=image_size,
     )
 
     print(f"[ckpt] Checkpoint       : {checkpoint_path}")
     print(f"[ckpt] Type             : {checkpoint_type}")
-    print(f"[ckpt] Model image_size : {effective_image_size}")
+    print(f"[ckpt] Model image_size : {image_size}")
     print(f"[ckpt] Adapter enabled  : {adapter_cfg is not None}")
 
-    # ── 阶段 1：adapter 模式先加载 base checkpoint 初始化 tracker ──────────────
-    if checkpoint_type == "adapter" and base_checkpoint:
+    # ── 阶段 1：adapter/no_adapter 模式先加载 base checkpoint 初始化 tracker ────
+    if checkpoint_type in ("adapter", "no_adapter") and base_checkpoint:
         print(f"[ckpt] Loading base checkpoint for tracker init: {base_checkpoint}")
         base_ckpt = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
         if "model" in base_ckpt and isinstance(base_ckpt["model"], dict):
@@ -158,7 +164,7 @@ def build_predictor(
         base_ckpt = {k: v for k, v in base_ckpt.items() if "freqs_cis" not in k}
         miss_b, unexp_b = predictor.model.load_state_dict(base_ckpt, strict=False)
         print(f"[ckpt]   Base  missing={len(miss_b)}, unexpected={len(unexp_b)}")
-    elif checkpoint_type == "adapter":
+    elif checkpoint_type in ("adapter", "no_adapter"):
         print("[ckpt] WARNING: no --base_checkpoint provided; tracker will be randomly "
               "initialized and propagation quality will be poor.")
 
@@ -509,11 +515,13 @@ def parse_args():
     )
     parser.add_argument(
         "--checkpoint_type",
-        choices=["adapter", "baseline"],
+        choices=["adapter", "no_adapter", "baseline"],
         required=True,
         help=(
-            "'adapter': training checkpoint container (keys like backbone.*), "
+            "'adapter': training checkpoint with adapter layers (keys like backbone.*), "
             "auto-prefixed with detector.*. "
+            "'no_adapter': direct fine-tune checkpoint without adapter layers but with "
+            "PromptGenerator (handcrafted_tune=True), same container format as adapter. "
             "'baseline': original sam3.pt direct format."
         ),
     )
@@ -545,8 +553,9 @@ def parse_args():
         type=int,
         default=1008,
         help=(
-            "Inference image size (default: 1008). For adapter type this is ignored "
-            "and always set to 1008 to keep tracker compatible with sam3.pt weights."
+            "Inference image size (default: 1008). For adapter/no_adapter types, "
+            "set to the training resolution (e.g. 280) to keep feature sizes consistent. "
+            "For baseline type, use 1008 to match sam3.pt."
         ),
     )
     parser.add_argument(
@@ -554,8 +563,9 @@ def parse_args():
         default=None,
         help=(
             "Path to baseline sam3.pt, used as Phase-1 weight initialization for "
-            "adapter inference (initializes tracker + backbone before loading adapter). "
-            "Recommended: sam3/sam3.pt. If omitted, tracker will be randomly initialized."
+            "adapter/no_adapter inference (initializes tracker + backbone before loading "
+            "fine-tuned weights). Recommended: sam3/sam3.pt. "
+            "If omitted, tracker will be randomly initialized."
         ),
     )
     parser.add_argument(
