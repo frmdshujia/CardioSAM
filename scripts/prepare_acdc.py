@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import nibabel as nib
@@ -11,6 +12,21 @@ from PIL import Image
 
 
 FRAME_RE = re.compile(r"frame(\d+)", re.IGNORECASE)
+DEBUG_LOG_PATH = Path("/data/home/shujia/CardioSAM/.cursor/debug.log")
+
+
+def debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict):
+    payload = {
+        "id": f"{int(time.time() * 1000)}_{os.getpid()}_{hypothesis_id}",
+        "timestamp": int(time.time() * 1000),
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+    }
+    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
 def parse_args():
@@ -333,6 +349,22 @@ def prepare_patient(
         return
 
     ed_frame, es_frame = parse_info_cfg(patient_dir)
+    # #region agent log
+    debug_log(
+        run_id="prepare-pre-fix",
+        hypothesis_id="H3",
+        location="prepare_acdc.py:prepare_patient:ed_es_parse",
+        message="Parsed ED/ES and frame file count",
+        data={
+            "patient_id": patient_id,
+            "ed_frame": ed_frame,
+            "es_frame": es_frame,
+            "num_frame_files": len(frame_files),
+            "frame_file_min": frame_files[0][0] if frame_files else None,
+            "frame_file_max": frame_files[-1][0] if frame_files else None,
+        },
+    )
+    # #endregion
     split = get_split_name(patient_dir)
     out_patient_root = output_root / split / patient_id
     out_images_root = out_patient_root / "images"
@@ -380,17 +412,62 @@ def prepare_patient(
             gt_volume = None
             if not skip_gt:
                 gt_volume = load_gt_volume(patient_dir, patient_id, frame_idx)
+            # #region agent log
+            debug_log(
+                run_id="prepare-pre-fix",
+                hypothesis_id="H2",
+                location="prepare_acdc.py:prepare_patient:gt_volume_load",
+                message="Attempted loading GT volume for keyframe",
+                data={
+                    "patient_id": patient_id,
+                    "phase": phase,
+                    "frame_idx": frame_idx,
+                    "gt_volume_exists": gt_volume is not None,
+                    "gt_expected_path": str(patient_dir / f"{patient_id}_frame{frame_idx:02d}_gt.nii.gz"),
+                    "volume_shape": list(volume_u8.shape),
+                },
+            )
+            # #endregion
             for z in slice_indices(volume_u8.shape[-1], slice_stride, max_slices):
                 out_path = phase_dir / f"slice_{z:02d}.png"
                 # save_slice_image(volume_u8[..., z], out_path)
                 if gt_volume is not None:
                     mask_slice = gt_volume[..., z].astype(np.uint8)
-                    # 如果该mask全是0，直接跳过导出
-                    if np.all(mask_slice == 0):
-                        continue
                     mask_path = mask_dir / f"slice_{z:02d}.png"
                     save_slice_image(mask_slice, mask_path)
                     save_slice_image(volume_u8[..., z], out_path)
+                    # #region agent log
+                    if np.all(mask_slice == 0):
+                        debug_log(
+                            run_id="prepare-pre-fix",
+                            hypothesis_id="H1",
+                            location="prepare_acdc.py:prepare_patient:export_zero_gt_slice",
+                            message="Exported all-zero GT slice (no longer skipped)",
+                            data={
+                                "patient_id": patient_id,
+                                "phase": phase,
+                                "frame_idx": frame_idx,
+                                "slice_id": f"slice_{z:02d}",
+                            },
+                        )
+                    # #endregion
+                    # #region agent log
+                    debug_log(
+                        run_id="prepare-pre-fix",
+                        hypothesis_id="H5",
+                        location="prepare_acdc.py:prepare_patient:export_gt_slice",
+                        message="Exported GT slice with structure occupancy",
+                        data={
+                            "patient_id": patient_id,
+                            "phase": phase,
+                            "frame_idx": frame_idx,
+                            "slice_id": f"slice_{z:02d}",
+                            "has_rv": bool(np.any(mask_slice == 1)),
+                            "has_myo": bool(np.any(mask_slice == 2)),
+                            "has_lv": bool(np.any(mask_slice == 3)),
+                        },
+                    )
+                    # #endregion
                     if not skip_gt_vis:
                         mask_vis_path = mask_vis_dir / f"slice_{z:02d}.png"
                         save_vis_mask(mask_slice, mask_vis_path)
@@ -445,6 +522,25 @@ def prepare_patient(
         inv_map = {v: k for k, v in frame_index_map.items()}
         meta["ed_frame_export_idx"] = inv_map.get(ed_frame - 1) if ed_frame is not None else None
         meta["es_frame_export_idx"] = inv_map.get(es_frame - 1) if es_frame is not None else None
+
+    # #region agent log
+    debug_log(
+        run_id="prepare-pre-fix",
+        hypothesis_id="H4",
+        location="prepare_acdc.py:prepare_patient:meta_export",
+        message="Prepared patient export summary",
+        data={
+            "patient_id": patient_id,
+            "split": split,
+            "video_num_frames": video_num_frames,
+            "ed_frame": ed_frame,
+            "es_frame": es_frame,
+            "ed_frame_export_idx": meta["ed_frame_export_idx"],
+            "es_frame_export_idx": meta["es_frame_export_idx"],
+            "num_exported_video_slices": len(exported_slices),
+        },
+    )
+    # #endregion
 
     out_patient_root.mkdir(parents=True, exist_ok=True)
     with (out_patient_root / "meta.json").open("w") as f:
